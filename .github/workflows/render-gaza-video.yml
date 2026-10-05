@@ -1,0 +1,50 @@
+name: Render Gaza documentary video
+
+on:
+  push:
+    branches:
+      - chatgpt-gaza-video-v1
+    paths:
+      - "video_gaza/**"
+      - ".github/workflows/render-gaza-video.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pillow requests
+
+      - name: Render video
+        run: python video_gaza/render_video.py
+
+      - name: Show output
+        run: |
+          ls -lh video_gaza/output
+          ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 video_gaza/output/gaza_criancas_amputadas_v1.mp4
+
+      - name: Upload video artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gaza-criancas-amputadas-v1
+          path: video_gaza/output/*
+          if-no-files-found: error
+          retention-days: 7
