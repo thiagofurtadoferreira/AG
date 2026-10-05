@@ -248,7 +248,7 @@ def main():
          "Fonte/foto: UNICEF State of Palestine / Eyad al-Baba"),
         ("ghada","Ghada",
          "Foi ferida quando o abrigo onde brincava com amigos foi atingido. Sofreu amputação no membro superior direito.",
-         "Fonte/foto: UNICEF / Mohammed Nateel — 6 mai. 2025"),
+         "Fonte/foto: UNICEF / Mohammed Nateel — 12 mai. 2025"),
     ]
 
     idx = 1
