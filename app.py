@@ -1,4 +1,5 @@
 import os
+import json
 import re
 import shutil
 import subprocess
@@ -20,6 +21,8 @@ app = FastAPI(title="ReelDrop", docs_url=None, redoc_url=None)
 lock = threading.RLock()
 slots = threading.BoundedSemaphore(1)
 jobs = {}
+preview_cache = {}
+preview_slots = threading.BoundedSemaphore(2)
 calls = defaultdict(deque)
 BASE = Path(tempfile.mkdtemp(prefix="reeldrop-"))
 
@@ -84,6 +87,65 @@ def canonical(raw):
 
     raise HTTPException(422, "Link do Facebook não reconhecido. Use /reel/, /videos/, /watch/?v=, /share/v/, /share/r/ ou fb.watch.")
 
+def select_thumbnail(meta):
+    thumbnail = meta.get("thumbnail")
+    options = meta.get("thumbnails") or []
+    ranked = sorted(
+        (item for item in options if isinstance(item, dict) and item.get("url")),
+        key=lambda item: (item.get("width") or 0) * (item.get("height") or 0),
+        reverse=True
+    )
+    for item in ranked:
+        url = item["url"]
+        if isinstance(url, str) and url.startswith("https://"):
+            return url
+    return thumbnail if isinstance(thumbnail, str) and thumbnail.startswith("https://") else None
+
+
+@app.post("/api/preview")
+def video_preview(payload: DownloadRequest):
+    url, code, platform = canonical(payload.url)
+    now = time.time()
+    with lock:
+        cached = preview_cache.get(url)
+        if cached and now - cached["timestamp"] < 1200:
+            return cached["data"]
+    if not preview_slots.acquire(blocking=False):
+        raise HTTPException(429, "Muitas solicitações de prévia. Tente novamente.")
+    try:
+        command = [
+            sys.executable, "-m", "yt_dlp", "--ignore-config", "--no-playlist",
+            "--skip-download", "--dump-single-json", "--no-warnings",
+            "--socket-timeout", "10", "--retries", "1", "--",
+            url,
+        ]
+        proc = subprocess.run(command, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=35, check=False)
+        if proc.returncode:
+            raise HTTPException(422, friendly(proc.stderr + proc.stdout, platform))
+        try:
+            meta = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            raise HTTPException(422, "Não foi possível identificar a capa do vídeo.")
+        if not isinstance(meta, dict):
+            raise HTTPException(422, "Não foi possível extrair informações deste vídeo.")
+        thumb = select_thumbnail(meta)
+        if not thumb:
+            raise HTTPException(422, "Este vídeo não disponibilizou imagem de capa.")
+        result = {
+            "url": url, "platform": platform, "shortcode": code,
+            "title": str(meta.get("title") or "Vídeo detectado")[:150],
+            "thumbnail": thumb,
+        }
+        with lock:
+            preview_cache[url] = {"timestamp": time.time(), "data": result}
+        return result
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "A captura da capa demorou demais. Tente novamente.")
+    finally:
+        preview_slots.release()
+
+
 def setjob(jobid, **kwargs):
     with lock:
         if jobid in jobs:
@@ -109,27 +171,57 @@ def friendly(msg, platform):
 def worker(jobid, url, code, platform, folder):
     try:
         folder.mkdir(parents=True, exist_ok=True)
-        setjob(jobid,status="downloading",message="Buscando a melhor qualidade disponível...")
-        cmd = [sys.executable,"-m","yt_dlp","--ignore-config","--no-playlist",
-               "--no-cache-dir","--no-mtime","--no-write-thumbnail","--no-write-info-json",
-               "--socket-timeout","20","--retries","2","--fragment-retries","2",
-               "--max-filesize","400M","--format","bv*+ba/b",
-               "--merge-output-format","mp4","--remux-video","mp4",
-               "-o",str(folder / (platform + "_" + code + ".%(ext)s")),"--",url]
-        p = subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
-                           text=True,timeout=180,check=False)
-        if p.returncode:
-            raise RuntimeError(friendly(p.stdout[-2000:], platform))
+        setjob(jobid, status="downloading", progress=0,
+               message="Conectando à plataforma e preparando o vídeo...")
+        cmd = [
+            sys.executable, "-m", "yt_dlp", "--ignore-config", "--no-playlist",
+            "--no-cache-dir", "--no-mtime", "--no-write-thumbnail",
+            "--no-write-info-json", "--socket-timeout", "20", "--retries", "2",
+            "--fragment-retries", "2", "--max-filesize", "400M",
+            "--newline", "--progress-template", "download:REELDROP_PROGRESS:%(progress._percent_str)s",
+            "--format", "bv*+ba/b", "--merge-output-format", "mp4",
+            "--remux-video", "mp4",
+            "-o", str(folder / (platform + "_" + code + ".%(ext)s")), "--", url
+        ]
+        history = deque(maxlen=30)
+        timed_out = threading.Event()
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, encoding="utf-8", errors="replace", bufsize=1) as proc:
+            def terminate():
+                if proc.poll() is None:
+                    timed_out.set()
+                    proc.kill()
+            timer = threading.Timer(180, terminate)
+            timer.daemon = True
+            timer.start()
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    history.append(line.strip())
+                    match = re.search(r"REELDROP_PROGRESS:\s*([\d.,]+)%", line)
+                    if match:
+                        try:
+                            pct = min(99, max(0, int(float(match.group(1).replace(",", ".")))))
+                            setjob(jobid, status="downloading", progress=pct,
+                                   message=f"Baixando o vídeo... {pct}%")
+                        except ValueError:
+                            pass
+                code_returned = proc.wait()
+            finally:
+                timer.cancel()
+        if timed_out.is_set():
+            raise RuntimeError("Tempo limite excedido. Tente novamente.")
+        if code_returned:
+            raise RuntimeError(friendly("\n".join(history), platform))
         result = folder / (platform + "_" + code + ".mp4")
-        if not result.exists() or not 0 < result.stat().st_size <= 400*1024*1024:
+        if not result.exists() or not 0 < result.stat().st_size <= 400 * 1024 * 1024:
             raise RuntimeError("Não foi possível obter um arquivo MP4 válido.")
-        setjob(jobid,status="ready",message="Vídeo pronto!",filename=result.name)
-    except subprocess.TimeoutExpired:
-        setjob(jobid,status="error",message="Tempo limite excedido. Tente novamente.")
+        setjob(jobid, status="ready", progress=100, message="Vídeo pronto!", filename=result.name)
     except Exception as e:
-        setjob(jobid,status="error",message=str(e)[:300])
+        setjob(jobid, status="error", message=str(e)[:300])
     finally:
         slots.release()
+
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -137,7 +229,7 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok","service":"ReelDrop","version":"1.1.0","platforms":["instagram","facebook"]}
+    return {"status":"ok","service":"ReelDrop","version":"1.2.0","platforms":["instagram","facebook"]}
 
 @app.post("/api/download",status_code=202)
 def download(payload:DownloadRequest, request:Request):
@@ -157,7 +249,7 @@ def download(payload:DownloadRequest, request:Request):
     jobid=uuid.uuid4().hex
     folder=BASE/jobid
     with lock:
-        jobs[jobid]={"status":"preparing","message":"Preparando download...","updated":now,"folder":folder,"platform":platform}
+        jobs[jobid]={"status":"preparing","message":"Preparando download...","progress":0,"updated":now,"folder":folder,"platform":platform}
     threading.Thread(target=worker,args=(jobid,url,code,platform,folder),daemon=True).start()
     return {"id":jobid,"status":"preparing","platform":platform}
 
@@ -166,7 +258,7 @@ def status(jobid:str):
     with lock:
         j=jobs.get(jobid)
         if not j:raise HTTPException(404,"Download não encontrado.")
-        return {"status":j["status"],"message":j["message"],"platform":j["platform"]}
+        return {"status":j["status"],"message":j["message"],"progress":j["progress"],"platform":j["platform"]}
 
 @app.get("/api/file/{jobid}")
 def file(jobid:str):
@@ -205,6 +297,21 @@ button{border:0;cursor:pointer;font:inherit;font-weight:750}
 footer{font-size:12px;line-height:1.7;color:#8089a8;margin-top:26px}
 a{color:#d7a1ff}
 @media(max-width:400px){.card{padding:16px}#paste{padding:0 8px;font-size:12px}}
+
+.preview{margin-top:16px;background:#101428;border:1px solid #414365;border-radius:14px;padding:12px;display:grid;grid-template-columns:125px 1fr;align-items:center;gap:12px}
+.preview img{width:125px;height:100px;object-fit:cover;border-radius:10px;background:#2a3050}
+.preview-details{min-width:0;display:flex;flex-direction:column;gap:7px;overflow:hidden}
+.preview-details strong{font-size:14px;line-height:1.4;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.preview-details small{color:#9eacdb;font-size:12px}
+.shares{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px}
+.shares a,.shares button{display:inline-flex;align-items:center;justify-content:center;padding:10px 11px;border:1px solid #535b81;border-radius:10px;background:#242b44;color:#f8f9ff;font-size:12px;font-weight:700;text-decoration:none}
+.shares #wa{background:#184734;border-color:#347454}
+.hidden{display:none!important}
+#progress-wrap{margin-top:8px}
+.track{height:7px;background:#252a45;overflow:hidden;border-radius:99px}
+#progress-bar{width:0;height:100%;background:linear-gradient(90deg,#be53eb,#ec54a5);transition:width .3s}
+.progress-hint{font-size:12px;margin:8px 0 0;text-align:center}
+@media(max-width:430px){.preview{grid-template-columns:95px 1fr}.preview img{width:95px;height:98px}.shares{display:grid;grid-template-columns:1fr}.shares button,.shares a{width:100%}}
 </style></head><body><main>
 <div class="brand"><span class="logo">▶</span>Reel<em>Drop</em></div>
 <div class="kicker">INSTAGRAM + FACEBOOK</div>
@@ -214,49 +321,111 @@ a{color:#d7a1ff}
 <div class="field"><input id="url" type="url" required placeholder="Cole o link do Instagram ou Facebook" autocomplete="url">
 <button id="paste" type="button">Colar link</button></div>
 <div id="platform" style="margin:12px 0 0;text-align:center;color:#b3a6ef;font-size:13px" aria-live="polite">Instagram e Facebook</div>
+<section id="preview" class="preview hidden" aria-label="Prévia do vídeo">
+  <img id="thumbnail" alt="Capa do vídeo" loading="lazy">
+  <div class="preview-details">
+    <strong id="preview-title">Vídeo detectado</strong>
+    <small id="preview-platform">Instagram ou Facebook</small>
+  </div>
+  <div class="shares">
+    <a id="wa" href="#" target="_blank" rel="noopener noreferrer">Compartilhar no WhatsApp</a>
+    <button id="share-native" type="button">Compartilhar</button>
+    <button id="share-copy" type="button">Copiar link</button>
+  </div>
+</section>
 <button id="go" type="submit">↓ &nbsp; Baixar vídeo</button></form>
-<div id="status" role="status" aria-live="polite"></div></div>
+<div id="status" role="status" aria-live="polite"></div>
+<div id="progress-wrap" class="hidden"><div class="track"><div id="progress-bar"></div></div><p class="progress-hint">O download no navegador será iniciado quando o vídeo estiver pronto.</p></div></div>
 <footer>Somente conteúdo público que você tem permissão para baixar.<br>Ferramenta independente, não afiliada ao Instagram ou Facebook.</footer>
 </main><script>
 const input=document.getElementById("url"),form=document.getElementById("form"),
-btn=document.getElementById("go"),notice=document.getElementById("status"),platform=document.getElementById("platform");
-
-function detect(){
-let label="Cole um link do Instagram ou Facebook";
-try{
-const u=new URL(input.value.trim()),h=u.hostname.toLowerCase();
-if(["instagram.com","www.instagram.com","m.instagram.com"].includes(h))label="✓ Instagram detectado";
-else if(["facebook.com","www.facebook.com","m.facebook.com","web.facebook.com","fb.watch","www.fb.watch"].includes(h))label="✓ Facebook detectado";
-else if(input.value.trim())label="Endereço não reconhecido";
-}catch(e){}
-platform.textContent=label;
-}
-input.addEventListener("input",detect);
-document.getElementById("paste").onclick=async()=>{
-try{input.value=await navigator.clipboard.readText();detect();input.focus()}catch(e){notice.textContent="Use Ctrl+V para colar o link.";input.focus()}};
+btn=document.getElementById("go"),notice=document.getElementById("status"),
+platform=document.getElementById("platform"),preview=document.getElementById("preview"),
+thumb=document.getElementById("thumbnail"),title=document.getElementById("preview-title"),
+previewPlatform=document.getElementById("preview-platform"),wa=document.getElementById("wa"),
+shareNative=document.getElementById("share-native"),shareCopy=document.getElementById("share-copy"),
+progressWrap=document.getElementById("progress-wrap"),progressBar=document.getElementById("progress-bar");
+const supported=["instagram.com","www.instagram.com","m.instagram.com","facebook.com","www.facebook.com","m.facebook.com","web.facebook.com","fb.watch","www.fb.watch"];
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
-form.onsubmit=async e=>{
-e.preventDefault();btn.disabled=true;notice.textContent="Preparando o vídeo...";
-try{
-const response=await fetch("/api/download",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:input.value.trim()})});
-const job=await response.json();
-if(!response.ok)throw Error(typeof job.detail==="string"?job.detail:"Não foi possível iniciar.");
-let ready=false;
-for(let i=0;i<95;i++){
-await pause(2000);
-const r=await fetch("/api/download/"+job.id);
-const s=await r.json();
-if(!r.ok)throw Error("Consulta de status falhou.");
-notice.textContent=s.message;
-if(s.status==="error")throw Error(s.message);
-if(s.status==="ready"){ready=true;break;}
+let timer=null, seq=0, aborter=null, shareURL="", busy=false;
+function platformOf(raw){
+  try{const u=new URL(raw.trim());if(u.protocol!=="https:" || !supported.includes(u.hostname.toLowerCase())) return null;
+  return u.hostname.includes("instagram")?"instagram":"facebook";}catch(e){return null}
 }
-if(!ready)throw Error("O processamento demorou demais.");
-notice.textContent="Transferindo seu MP4...";
-const a=document.createElement("a");a.href="/api/file/"+job.id;a.download="";
-document.body.appendChild(a);a.click();a.remove();
-notice.textContent="Download iniciado! Confira os arquivos do navegador.";
-}catch(err){notice.textContent=err.message||"Falha inesperada no download."}
-finally{btn.disabled=false}
+function detect(){
+  const found=platformOf(input.value);
+  platform.textContent=found==="instagram"?"✓ Instagram detectado":found==="facebook"?"✓ Facebook detectado":"Cole um link válido do Instagram ou Facebook";
+}
+function hidePreview(){preview.classList.add("hidden");thumb.removeAttribute("src");shareURL="";}
+function setProgress(message,pct=0){
+  progressWrap.classList.remove("hidden");notice.textContent=message;
+  progressBar.style.width=Math.min(100,Math.max(0,pct))+"%";
+}
+function refresh(){
+  detect();clearTimeout(timer);seq++;if(aborter)aborter.abort();hidePreview();
+  if(!platformOf(input.value))return;
+  const request=seq;
+  timer=setTimeout(async()=>{
+    const pasted=input.value.trim();
+    aborter=new AbortController();
+    notice.textContent="Capturando capa do vídeo...";
+    try{
+      const response=await fetch("/api/preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:pasted}),signal:aborter.signal});
+      const result=await response.json();
+      if(request!==seq || pasted!==input.value.trim())return;
+      if(!response.ok)throw Error(result.detail||"Capa indisponível para este vídeo.");
+      shareURL=result.url;
+      title.textContent=result.title||"Vídeo detectado";
+      previewPlatform.textContent=result.platform==="facebook"?"Facebook":"Instagram";
+      thumb.src=result.thumbnail;
+      thumb.alt="Capa do vídeo: "+title.textContent;
+      wa.href="https://wa.me/?text="+encodeURIComponent("Veja este vídeo: "+shareURL);
+      preview.classList.remove("hidden");notice.textContent="";
+    }catch(e){
+      if(e.name!=="AbortError" && request===seq){notice.textContent="Prévia indisponível. Você ainda pode tentar baixar o vídeo."}
+    }
+  },600);
+}
+input.addEventListener("input",refresh);
+document.getElementById("paste").onclick=async()=>{
+  try{input.value=await navigator.clipboard.readText();refresh();input.focus();}
+  catch(e){notice.textContent="Use Ctrl+V ou pressione e segure para colar.";input.focus();}
+};
+shareNative.onclick=async()=>{
+  if(!shareURL)return;
+  try{
+    if(navigator.share)await navigator.share({title:title.textContent,text:"Veja este vídeo",url:shareURL});
+    else {await navigator.clipboard.writeText(shareURL);notice.textContent="Link copiado para compartilhar.";}
+  }catch(e){if(e.name!=="AbortError")notice.textContent="Não foi possível compartilhar neste navegador.";}
+};
+shareCopy.onclick=async()=>{
+  if(!shareURL)return;
+  try{await navigator.clipboard.writeText(shareURL);notice.textContent="Link copiado!";}
+  catch(e){notice.textContent="Não foi possível copiar o link.";}
+};
+form.onsubmit=async e=>{
+ e.preventDefault();if(busy)return;
+ if(!platformOf(input.value)){notice.textContent="Cole um link HTTPS válido.";return;}
+ busy=true;btn.disabled=true;btn.textContent="Baixando... aguarde";setProgress("Preparando vídeo...",0);
+ try{
+  const response=await fetch("/api/download",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:input.value.trim()})});
+  const created=await response.json();
+  if(!response.ok)throw Error(created.detail||"Não foi possível iniciar.");
+  let ready=false;
+  for(let i=0;i<100;i++){
+   const r=await fetch("/api/download/"+created.id,{cache:"no-store"});
+   const j=await r.json();
+   if(!r.ok)throw Error(j.detail||"Consulta falhou.");
+   setProgress(j.message||"Baixando vídeo...",j.progress||0);
+   if(j.status==="error")throw Error(j.message||"Não foi possível baixar o vídeo.");
+   if(j.status==="ready"){ready=true;break;}
+   await pause(2000);
+  }
+  if(!ready)throw Error("Tempo limite de processamento.");
+  setProgress("Vídeo pronto! Iniciando download no navegador...",100);
+  const a=document.createElement("a");a.href="/api/file/"+created.id;
+  a.style.display="none";document.body.appendChild(a);a.click();a.remove();
+ }catch(e){notice.textContent=e.message||"Erro inesperado.";progressWrap.classList.add("hidden");}
+ finally{busy=false;btn.disabled=false;btn.textContent="↓  Baixar vídeo";}
 };
 </script></body></html>"""
