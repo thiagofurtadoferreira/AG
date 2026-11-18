@@ -34,6 +34,10 @@ FB_VIDEO = re.compile(r"^/(?:[A-Za-z0-9._-]+/)?videos/([0-9]{5,25})/?$")
 FB_SHARE = re.compile(r"^/share/(?:v|r)/([A-Za-z0-9_-]{5,100})/?$")
 FB_WATCH_HOSTS = {"facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com"}
 FB_SHORT_HOSTS = {"fb.watch", "www.fb.watch"}
+YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
+YT_SHORT_HOSTS = {"youtu.be", "www.youtu.be"}
+YT_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+YT_PATH = re.compile(r"^/(shorts|live|embed)/([A-Za-z0-9_-]{11})/?$")
 
 class DownloadRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
@@ -51,16 +55,33 @@ def canonical(raw):
         host = u.hostname
         if (u.scheme != "https" or u.username or u.password
                 or u.port is not None
-                or host not in {"instagram.com", "www.instagram.com", "m.instagram.com"} | FB_WATCH_HOSTS | FB_SHORT_HOSTS):
+                or host not in {"instagram.com", "www.instagram.com", "m.instagram.com"} | FB_WATCH_HOSTS | FB_SHORT_HOSTS | YT_HOSTS | YT_SHORT_HOSTS):
             raise ValueError()
     except ValueError:
-        raise HTTPException(422, "Cole um link HTTPS válido do Instagram ou Facebook.")
+        raise HTTPException(422, "Cole um link HTTPS válido do Instagram, Facebook ou YouTube.")
 
     if host in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
         m = SHORTCODE.fullmatch(u.path)
         if not m:
             raise HTTPException(422, "Para Instagram, use um link /reel/, /p/ ou /tv/.")
         return "https://www.instagram.com/" + m.group(1) + "/" + m.group(2) + "/", m.group(2), "instagram"
+
+    if host in YT_SHORT_HOSTS:
+        code = u.path.strip("/")
+        if not YT_ID.fullmatch(code):
+            raise HTTPException(422, "Link youtu.be inválido. Cole o endereço de um vídeo.")
+        return "https://youtu.be/" + code, code, "youtube"
+
+    if host in YT_HOSTS:
+        if u.path.rstrip("/") == "/watch":
+            videos = parse_qs(u.query).get("v", [])
+            if len(videos) == 1 and YT_ID.fullmatch(videos[0]):
+                return "https://www.youtube.com/watch?v=" + videos[0], videos[0], "youtube"
+        match = YT_PATH.fullmatch(u.path)
+        if match:
+            kind, code = match.groups()
+            return "https://www.youtube.com/" + kind + "/" + code, code, "youtube"
+        raise HTTPException(422, "YouTube: use /watch?v=, /shorts/, /live/, /embed/ ou youtu.be.")
 
     if host in FB_SHORT_HOSTS:
         token = u.path.strip("/")
@@ -86,6 +107,13 @@ def canonical(raw):
             return "https://www.facebook.com/watch/?v=" + ids[0], ids[0], "facebook"
 
     raise HTTPException(422, "Link do Facebook não reconhecido. Use /reel/, /videos/, /watch/?v=, /share/v/, /share/r/ ou fb.watch.")
+
+def youtube_preview_fallback(url, code):
+    """YouTube's public thumbnail may be available without full video metadata."""
+    return {"url": url, "shortcode": code, "platform": "youtube",
+            "title": "Vídeo do YouTube", "thumbnail": "https://i.ytimg.com/vi/" + code + "/hqdefault.jpg",
+            "verified": False}
+
 
 def select_thumbnail(meta):
     thumbnail = meta.get("thumbnail")
@@ -116,21 +144,28 @@ def video_preview(payload: DownloadRequest):
         command = [
             sys.executable, "-m", "yt_dlp", "--ignore-config", "--no-playlist",
             "--skip-download", "--dump-single-json", "--no-warnings",
-            "--socket-timeout", "10", "--retries", "1", "--",
-            url,
+            "--socket-timeout", "10", "--retries", "1",
+            *(["--js-runtimes", "node"] if platform == "youtube" else []),
+            "--", url,
         ]
         proc = subprocess.run(command, capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=35, check=False)
         if proc.returncode:
+            if platform == "youtube":
+                return youtube_preview_fallback(url, code)
             raise HTTPException(422, friendly(proc.stderr + proc.stdout, platform))
         try:
             meta = json.loads(proc.stdout)
         except json.JSONDecodeError:
+            if platform == "youtube":
+                return youtube_preview_fallback(url, code)
             raise HTTPException(422, "Não foi possível identificar a capa do vídeo.")
         if not isinstance(meta, dict):
             raise HTTPException(422, "Não foi possível extrair informações deste vídeo.")
         thumb = select_thumbnail(meta)
         if not thumb:
+            if platform == "youtube":
+                return youtube_preview_fallback(url, code)
             raise HTTPException(422, "Este vídeo não disponibilizou imagem de capa.")
         result = {
             "url": url, "platform": platform, "shortcode": code,
@@ -141,6 +176,8 @@ def video_preview(payload: DownloadRequest):
             preview_cache[url] = {"timestamp": time.time(), "data": result}
         return result
     except subprocess.TimeoutExpired:
+        if platform == "youtube":
+            return youtube_preview_fallback(url, code)
         raise HTTPException(504, "A captura da capa demorou demais. Tente novamente.")
     finally:
         preview_slots.release()
@@ -161,8 +198,8 @@ def cleanup(jobid):
 
 def friendly(msg, platform):
     m = msg.lower()
-    provider = "Facebook" if platform == "facebook" else "Instagram"
-    if any(s in m for s in ("login", "cookies", "private", "sign in", "rate limit", "429", "cannot parse data", "no video formats found")):
+    provider = {"facebook": "Facebook", "instagram": "Instagram", "youtube": "YouTube"}.get(platform, "A plataforma")
+    if any(s in m for s in ("login", "cookies", "private", "sign in", "rate limit", "429", "cannot parse data", "no video formats found", "confirm you\'re not a bot", "confirm you are not a bot")):
         return f"O {provider} exigiu autenticação, bloqueou o acesso ou alterou a extração. Tente outro vídeo público ou mais tarde."
     if any(s in m for s in ("404", "not available", "unavailable", "not found")):
         return "Vídeo não encontrado ou indisponível publicamente."
@@ -178,6 +215,7 @@ def worker(jobid, url, code, platform, folder):
             "--no-cache-dir", "--no-mtime", "--no-write-thumbnail",
             "--no-write-info-json", "--socket-timeout", "20", "--retries", "2",
             "--fragment-retries", "2", "--max-filesize", "400M",
+            *(["--js-runtimes", "node"] if platform == "youtube" else []),
             "--newline", "--progress-template", "download:REELDROP_PROGRESS:%(progress._percent_str)s",
             "--format", "bv*+ba/b", "--merge-output-format", "mp4",
             "--remux-video", "mp4",
@@ -229,7 +267,7 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok","service":"ReelDrop","version":"1.2.0","platforms":["instagram","facebook"]}
+    return {"status":"ok","service":"ReelDrop","version":"1.3.0","platforms":["instagram","facebook","youtube"]}
 
 @app.post("/api/download",status_code=202)
 def download(payload:DownloadRequest, request:Request):
@@ -272,7 +310,7 @@ def file(jobid:str):
 
 PAGE = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ReelDrop — Baixar vídeos do Instagram e Facebook</title>
+<title>ReelDrop — Baixar vídeos do Instagram, Facebook e YouTube</title>
 <style>
 *{box-sizing:border-box}body{margin:0;min-height:100vh;font:16px system-ui,-apple-system,Segoe UI,sans-serif;color:#fff;background:#0c1020;display:flex;align-items:center;justify-content:center;overflow-x:hidden}
 body:before{content:"";position:fixed;inset:-30%;background:radial-gradient(ellipse at 25% 30%,#7935b943,transparent 40%),radial-gradient(ellipse at 85% 65%,#2562ce36,transparent 40%);pointer-events:none}
@@ -314,18 +352,18 @@ a{color:#d7a1ff}
 @media(max-width:430px){.preview{grid-template-columns:95px 1fr}.preview img{width:95px;height:98px}.shares{display:grid;grid-template-columns:1fr}.shares button,.shares a{width:100%}}
 </style></head><body><main>
 <div class="brand"><span class="logo">▶</span>Reel<em>Drop</em></div>
-<div class="kicker">INSTAGRAM + FACEBOOK</div>
+<div class="kicker">INSTAGRAM + FACEBOOK + YOUTUBE</div>
 <h1>Seu vídeo favorito,<br><span>em um clique.</span></h1>
-<p>Cole o link de um vídeo público do Instagram ou Facebook. O site identifica a plataforma e baixa o MP4 na melhor qualidade disponível.</p>
+<p>Cole o link de um vídeo público do Instagram, Facebook ou YouTube. O site identifica a plataforma e baixa o MP4 na melhor qualidade acessível.</p>
 <div class="card"><form id="form"><label for="url">Link do vídeo</label>
-<div class="field"><input id="url" type="url" required placeholder="Cole o link do Instagram ou Facebook" autocomplete="url">
+<div class="field"><input id="url" type="url" required placeholder="Cole um link do Instagram, Facebook ou YouTube" autocomplete="url">
 <button id="paste" type="button">Colar link</button></div>
-<div id="platform" style="margin:12px 0 0;text-align:center;color:#b3a6ef;font-size:13px" aria-live="polite">Instagram e Facebook</div>
+<div id="platform" style="margin:12px 0 0;text-align:center;color:#b3a6ef;font-size:13px" aria-live="polite">Instagram, Facebook e YouTube</div>
 <section id="preview" class="preview hidden" aria-label="Prévia do vídeo">
   <img id="thumbnail" alt="Capa do vídeo" loading="lazy">
   <div class="preview-details">
     <strong id="preview-title">Vídeo detectado</strong>
-    <small id="preview-platform">Instagram ou Facebook</small>
+    <small id="preview-platform">Instagram, Facebook ou YouTube</small>
   </div>
   <div class="shares">
     <a id="wa" href="#" target="_blank" rel="noopener noreferrer">Compartilhar no WhatsApp</a>
@@ -336,7 +374,7 @@ a{color:#d7a1ff}
 <button id="go" type="submit">↓ &nbsp; Baixar vídeo</button></form>
 <div id="status" role="status" aria-live="polite"></div>
 <div id="progress-wrap" class="hidden"><div class="track"><div id="progress-bar"></div></div><p class="progress-hint">O download no navegador será iniciado quando o vídeo estiver pronto.</p></div></div>
-<footer>Somente conteúdo público que você tem permissão para baixar.<br>Ferramenta independente, não afiliada ao Instagram ou Facebook.</footer>
+<footer>Somente conteúdo público que você tem permissão para baixar.<br>Ferramenta independente, não afiliada ao Instagram, Facebook ou YouTube.</footer>
 </main><script>
 const input=document.getElementById("url"),form=document.getElementById("form"),
 btn=document.getElementById("go"),notice=document.getElementById("status"),
@@ -345,16 +383,31 @@ thumb=document.getElementById("thumbnail"),title=document.getElementById("previe
 previewPlatform=document.getElementById("preview-platform"),wa=document.getElementById("wa"),
 shareNative=document.getElementById("share-native"),shareCopy=document.getElementById("share-copy"),
 progressWrap=document.getElementById("progress-wrap"),progressBar=document.getElementById("progress-bar");
-const supported=["instagram.com","www.instagram.com","m.instagram.com","facebook.com","www.facebook.com","m.facebook.com","web.facebook.com","fb.watch","www.fb.watch"];
+const supported=["instagram.com","www.instagram.com","m.instagram.com","facebook.com","www.facebook.com","m.facebook.com","web.facebook.com","fb.watch","www.fb.watch","youtube.com","www.youtube.com","m.youtube.com","music.youtube.com","youtu.be","www.youtu.be"];
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 let timer=null, seq=0, aborter=null, shareURL="", busy=false;
 function platformOf(raw){
   try{const u=new URL(raw.trim());if(u.protocol!=="https:" || !supported.includes(u.hostname.toLowerCase())) return null;
-  return u.hostname.includes("instagram")?"instagram":"facebook";}catch(e){return null}
+  if(u.hostname.includes("instagram"))return "instagram";
+  if(u.hostname.includes("youtube")||u.hostname.includes("youtu.be"))return "youtube";
+  return "facebook";}catch(e){return null}
 }
 function detect(){
   const found=platformOf(input.value);
-  platform.textContent=found==="instagram"?"✓ Instagram detectado":found==="facebook"?"✓ Facebook detectado":"Cole um link válido do Instagram ou Facebook";
+  platform.textContent=found==="instagram"?"✓ Instagram detectado":found==="facebook"?"✓ Facebook detectado":found==="youtube"?"✓ YouTube detectado":"Cole um link válido do Instagram, Facebook ou YouTube";
+}
+function youtubeCode(raw) {
+ try {
+  const u = new URL(raw);
+  const host = u.hostname.toLowerCase();
+  let id = null;
+  if(host==="youtu.be"||host==="www.youtu.be") id=u.pathname.replace(/^\/|\/$/g,"");
+  else if(host.includes("youtube.com")) {
+    if(u.pathname==="/watch") id=u.searchParams.get("v");
+    else { const m=u.pathname.match(/^\/(?:shorts|live|embed)\/([A-Za-z0-9_-]{11})\/?$/); if(m)id=m[1]; }
+  }
+  return id&&/^[A-Za-z0-9_-]{11}$/.test(id)?id:null;
+ } catch(e){return null;}
 }
 function hidePreview(){preview.classList.add("hidden");thumb.removeAttribute("src");shareURL="";}
 function setProgress(message,pct=0){
@@ -363,7 +416,19 @@ function setProgress(message,pct=0){
 }
 function refresh(){
   detect();clearTimeout(timer);seq++;if(aborter)aborter.abort();hidePreview();
-  if(!platformOf(input.value))return;
+  const found=platformOf(input.value);
+  if(!found)return;
+  if(found==="youtube") {
+    const id=youtubeCode(input.value.trim());
+    if(id) {
+      preview.classList.remove("hidden");
+      title.textContent="Capa do vídeo do YouTube";
+      previewPlatform.textContent="YouTube";
+      thumb.src="https://i.ytimg.com/vi/"+id+"/hqdefault.jpg";
+      shareURL=input.value.trim();
+      wa.href="https://wa.me/?text="+encodeURIComponent("Veja este vídeo: "+shareURL);
+    }
+  }
   const request=seq;
   timer=setTimeout(async()=>{
     const pasted=input.value.trim();
@@ -376,7 +441,7 @@ function refresh(){
       if(!response.ok)throw Error(result.detail||"Capa indisponível para este vídeo.");
       shareURL=result.url;
       title.textContent=result.title||"Vídeo detectado";
-      previewPlatform.textContent=result.platform==="facebook"?"Facebook":"Instagram";
+      previewPlatform.textContent=result.platform==="youtube"?"YouTube":result.platform==="facebook"?"Facebook":"Instagram";
       thumb.src=result.thumbnail;
       thumb.alt="Capa do vídeo: "+title.textContent;
       wa.href="https://wa.me/?text="+encodeURIComponent("Veja este vídeo: "+shareURL);
