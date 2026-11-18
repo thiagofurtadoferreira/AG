@@ -9,7 +9,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, FileResponse
@@ -22,23 +22,67 @@ slots = threading.BoundedSemaphore(1)
 jobs = {}
 calls = defaultdict(deque)
 BASE = Path(tempfile.mkdtemp(prefix="reeldrop-"))
+
 SHORTCODE = re.compile(r"^/(reel|p|tv)/([A-Za-z0-9_-]{5,32})/?$")
+FB_NUMERIC = re.compile(r"^[0-9]{5,25}$")
+FB_TOKEN = re.compile(r"^[A-Za-z0-9_-]{5,100}$")
+FB_REEL = re.compile(r"^/reel/([0-9]{5,25})/?$")
+FB_VIDEO = re.compile(r"^/(?:[A-Za-z0-9._-]+/)?videos/([0-9]{5,25})/?$")
+FB_SHARE = re.compile(r"^/share/(?:v|r)/([A-Za-z0-9_-]{5,100})/?$")
+FB_WATCH_HOSTS = {"facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com"}
+FB_SHORT_HOSTS = {"fb.watch", "www.fb.watch"}
 
 class DownloadRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
 
+
 def canonical(raw):
+    """Allow only video-shaped URLs from supported social platforms.
+
+    Do not forward arbitrary user-supplied URLs to the downloader.
+    Tracking query strings are removed; a watch URL retains only numeric video IDs.
+    """
     raw = raw.strip()
     try:
         u = urlsplit(raw)
-        if u.scheme != "https" or u.hostname not in ("instagram.com","www.instagram.com","m.instagram.com") or u.port is not None or u.username or u.password:
+        host = u.hostname
+        if (u.scheme != "https" or u.username or u.password
+                or u.port is not None
+                or host not in {"instagram.com", "www.instagram.com", "m.instagram.com"} | FB_WATCH_HOSTS | FB_SHORT_HOSTS):
             raise ValueError()
     except ValueError:
-        raise HTTPException(422, "Cole um link HTTPS válido do Instagram.")
-    m = SHORTCODE.fullmatch(u.path)
-    if not m:
-        raise HTTPException(422, "Aceitamos URLs /reel/, /p/ ou /tv/ do Instagram.")
-    return "https://www.instagram.com/" + m.group(1) + "/" + m.group(2) + "/", m.group(2)
+        raise HTTPException(422, "Cole um link HTTPS válido do Instagram ou Facebook.")
+
+    if host in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
+        m = SHORTCODE.fullmatch(u.path)
+        if not m:
+            raise HTTPException(422, "Para Instagram, use um link /reel/, /p/ ou /tv/.")
+        return "https://www.instagram.com/" + m.group(1) + "/" + m.group(2) + "/", m.group(2), "instagram"
+
+    if host in FB_SHORT_HOSTS:
+        token = u.path.strip("/")
+        if not FB_TOKEN.fullmatch(token):
+            raise HTTPException(422, "Link curto do Facebook inválido.")
+        return "https://fb.watch/" + token + "/", token, "facebook"
+
+    m = FB_REEL.fullmatch(u.path)
+    if m:
+        return "https://www.facebook.com/reel/" + m.group(1) + "/", m.group(1), "facebook"
+
+    m = FB_VIDEO.fullmatch(u.path)
+    if m:
+        return "https://www.facebook.com" + u.path.rstrip("/") + "/", m.group(1), "facebook"
+
+    m = FB_SHARE.fullmatch(u.path)
+    if m:
+        return "https://www.facebook.com" + u.path.rstrip("/") + "/", m.group(1), "facebook"
+
+    if u.path.rstrip("/") in ("/watch", "/video.php"):
+        ids = parse_qs(u.query).get("v", [])
+        if len(ids) == 1 and FB_NUMERIC.fullmatch(ids[0]):
+            return "https://www.facebook.com/watch/?v=" + ids[0], ids[0], "facebook"
+
+    raise HTTPException(422, "Link do Facebook não reconhecido. Use /reel/, /videos/, /watch/?v=, /share/v/, /share/r/ ou fb.watch.")
 
 def setjob(jobid, **kwargs):
     with lock:
@@ -52,15 +96,17 @@ def cleanup(jobid):
     if j:
         shutil.rmtree(j["folder"], ignore_errors=True)
 
-def friendly(msg):
+
+def friendly(msg, platform):
     m = msg.lower()
-    if any(s in m for s in ("login", "cookies", "private", "sign in", "rate limit", "429")):
-        return "O Instagram exigiu autenticação ou limitou o acesso. Tente outro Reel público ou mais tarde."
+    provider = "Facebook" if platform == "facebook" else "Instagram"
+    if any(s in m for s in ("login", "cookies", "private", "sign in", "rate limit", "429", "cannot parse data", "no video formats found")):
+        return f"O {provider} exigiu autenticação, bloqueou o acesso ou alterou a extração. Tente outro vídeo público ou mais tarde."
     if any(s in m for s in ("404", "not available", "unavailable", "not found")):
         return "Vídeo não encontrado ou indisponível publicamente."
-    return "Não foi possível baixar este vídeo. O Instagram pode ter restringido o acesso."
+    return f"Não foi possível baixar este vídeo. O {provider} pode ter restringido o acesso."
 
-def worker(jobid, url, code, folder):
+def worker(jobid, url, code, platform, folder):
     try:
         folder.mkdir(parents=True, exist_ok=True)
         setjob(jobid,status="downloading",message="Buscando a melhor qualidade disponível...")
@@ -69,12 +115,12 @@ def worker(jobid, url, code, folder):
                "--socket-timeout","20","--retries","2","--fragment-retries","2",
                "--max-filesize","400M","--format","bv*+ba/b",
                "--merge-output-format","mp4","--remux-video","mp4",
-               "-o",str(folder / ("instagram_" + code + ".%(ext)s")),"--",url]
+               "-o",str(folder / (platform + "_" + code + ".%(ext)s")),"--",url]
         p = subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
                            text=True,timeout=180,check=False)
         if p.returncode:
-            raise RuntimeError(friendly(p.stdout[-2000:]))
-        result = folder / ("instagram_" + code + ".mp4")
+            raise RuntimeError(friendly(p.stdout[-2000:], platform))
+        result = folder / (platform + "_" + code + ".mp4")
         if not result.exists() or not 0 < result.stat().st_size <= 400*1024*1024:
             raise RuntimeError("Não foi possível obter um arquivo MP4 válido.")
         setjob(jobid,status="ready",message="Vídeo pronto!",filename=result.name)
@@ -91,11 +137,11 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok","service":"ReelDrop","version":"1.0.1-online"}
+    return {"status":"ok","service":"ReelDrop","version":"1.1.0","platforms":["instagram","facebook"]}
 
 @app.post("/api/download",status_code=202)
 def download(payload:DownloadRequest, request:Request):
-    url,code = canonical(payload.url)
+    url,code,platform = canonical(payload.url)
     ip = request.client.host if request.client else "unknown"
     now=time.time()
     with lock:
@@ -111,16 +157,16 @@ def download(payload:DownloadRequest, request:Request):
     jobid=uuid.uuid4().hex
     folder=BASE/jobid
     with lock:
-        jobs[jobid]={"status":"preparing","message":"Preparando download...","updated":now,"folder":folder}
-    threading.Thread(target=worker,args=(jobid,url,code,folder),daemon=True).start()
-    return {"id":jobid,"status":"preparing"}
+        jobs[jobid]={"status":"preparing","message":"Preparando download...","updated":now,"folder":folder,"platform":platform}
+    threading.Thread(target=worker,args=(jobid,url,code,platform,folder),daemon=True).start()
+    return {"id":jobid,"status":"preparing","platform":platform}
 
 @app.get("/api/download/{jobid}")
 def status(jobid:str):
     with lock:
         j=jobs.get(jobid)
         if not j:raise HTTPException(404,"Download não encontrado.")
-        return {"status":j["status"],"message":j["message"]}
+        return {"status":j["status"],"message":j["message"],"platform":j["platform"]}
 
 @app.get("/api/file/{jobid}")
 def file(jobid:str):
@@ -134,7 +180,7 @@ def file(jobid:str):
 
 PAGE = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ReelDrop — Baixar vídeos do Instagram</title>
+<title>ReelDrop — Baixar vídeos do Instagram e Facebook</title>
 <style>
 *{box-sizing:border-box}body{margin:0;min-height:100vh;font:16px system-ui,-apple-system,Segoe UI,sans-serif;color:#fff;background:#0c1020;display:flex;align-items:center;justify-content:center;overflow-x:hidden}
 body:before{content:"";position:fixed;inset:-30%;background:radial-gradient(ellipse at 25% 30%,#7935b943,transparent 40%),radial-gradient(ellipse at 85% 65%,#2562ce36,transparent 40%);pointer-events:none}
@@ -161,20 +207,33 @@ a{color:#d7a1ff}
 @media(max-width:400px){.card{padding:16px}#paste{padding:0 8px;font-size:12px}}
 </style></head><body><main>
 <div class="brand"><span class="logo">▶</span>Reel<em>Drop</em></div>
-<div class="kicker">INSTAGRAM REELS & VÍDEOS</div>
+<div class="kicker">INSTAGRAM + FACEBOOK</div>
 <h1>Seu vídeo favorito,<br><span>em um clique.</span></h1>
-<p>Cole o link de um vídeo público do Instagram e baixe em MP4, na melhor qualidade disponível. Sem cadastro, sem complicação.</p>
+<p>Cole o link de um vídeo público do Instagram ou Facebook. O site identifica a plataforma e baixa o MP4 na melhor qualidade disponível.</p>
 <div class="card"><form id="form"><label for="url">Link do vídeo</label>
-<div class="field"><input id="url" type="url" required placeholder="https://www.instagram.com/reel/..." autocomplete="url">
+<div class="field"><input id="url" type="url" required placeholder="Cole o link do Instagram ou Facebook" autocomplete="url">
 <button id="paste" type="button">Colar link</button></div>
+<div id="platform" style="margin:12px 0 0;text-align:center;color:#b3a6ef;font-size:13px" aria-live="polite">Instagram e Facebook</div>
 <button id="go" type="submit">↓ &nbsp; Baixar vídeo</button></form>
 <div id="status" role="status" aria-live="polite"></div></div>
-<footer>Somente conteúdo público que você tem permissão para baixar.<br>Ferramenta independente, não afiliada ao Instagram.</footer>
+<footer>Somente conteúdo público que você tem permissão para baixar.<br>Ferramenta independente, não afiliada ao Instagram ou Facebook.</footer>
 </main><script>
 const input=document.getElementById("url"),form=document.getElementById("form"),
-btn=document.getElementById("go"),notice=document.getElementById("status");
+btn=document.getElementById("go"),notice=document.getElementById("status"),platform=document.getElementById("platform");
+
+function detect(){
+let label="Cole um link do Instagram ou Facebook";
+try{
+const u=new URL(input.value.trim()),h=u.hostname.toLowerCase();
+if(["instagram.com","www.instagram.com","m.instagram.com"].includes(h))label="✓ Instagram detectado";
+else if(["facebook.com","www.facebook.com","m.facebook.com","web.facebook.com","fb.watch","www.fb.watch"].includes(h))label="✓ Facebook detectado";
+else if(input.value.trim())label="Endereço não reconhecido";
+}catch(e){}
+platform.textContent=label;
+}
+input.addEventListener("input",detect);
 document.getElementById("paste").onclick=async()=>{
-try{input.value=await navigator.clipboard.readText();input.focus()}catch(e){notice.textContent="Use Ctrl+V para colar o link.";input.focus()}};
+try{input.value=await navigator.clipboard.readText();detect();input.focus()}catch(e){notice.textContent="Use Ctrl+V para colar o link.";input.focus()}};
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 form.onsubmit=async e=>{
 e.preventDefault();btn.disabled=true;notice.textContent="Preparando o vídeo...";
@@ -194,7 +253,7 @@ if(s.status==="ready"){ready=true;break;}
 }
 if(!ready)throw Error("O processamento demorou demais.");
 notice.textContent="Transferindo seu MP4...";
-const a=document.createElement("a");a.href="/api/file/"+job.id;a.download="instagram.mp4";
+const a=document.createElement("a");a.href="/api/file/"+job.id;a.download="";
 document.body.appendChild(a);a.click();a.remove();
 notice.textContent="Download iniciado! Confira os arquivos do navegador.";
 }catch(err){notice.textContent=err.message||"Falha inesperada no download."}
