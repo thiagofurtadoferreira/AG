@@ -199,7 +199,11 @@ def cleanup(jobid):
 def friendly(msg, platform):
     m = msg.lower()
     provider = {"facebook": "Facebook", "instagram": "Instagram", "youtube": "YouTube"}.get(platform, "A plataforma")
-    if any(s in m for s in ("login", "cookies", "private", "sign in", "rate limit", "429", "cannot parse data", "no video formats found", "confirm you\'re not a bot", "confirm you are not a bot")):
+    if platform == "youtube" and ("429" in m or "too many requests" in m):
+        return "O YouTube limitou o acesso deste servidor (erro 429). O vídeo não pode ser baixado daqui agora. Abra o vídeo no YouTube ou tente mais tarde."
+    if platform == "youtube" and ("403" in m or "forbidden" in m or "failed to extract any player response" in m or "confirm you" in m):
+        return "O YouTube bloqueou o acesso deste servidor ao vídeo (erro 403). Não há download disponível aqui no momento."
+    if any(s in m for s in ("login", "cookies", "private", "sign in", "rate limit", "429", "cannot parse data", "no video formats found", "confirm you're not a bot", "confirm you are not a bot")):
         return f"O {provider} exigiu autenticação, bloqueou o acesso ou alterou a extração. Tente outro vídeo público ou mais tarde."
     if any(s in m for s in ("404", "not available", "unavailable", "not found")):
         return "Vídeo não encontrado ou indisponível publicamente."
@@ -250,7 +254,16 @@ def worker(jobid, url, code, platform, folder):
         if timed_out.is_set():
             raise RuntimeError("Tempo limite excedido. Tente novamente.")
         if code_returned:
-            raise RuntimeError(friendly("\n".join(history), platform))
+            failure = "\n".join(history)
+            if platform == "youtube":
+                indicators = []
+                for label, term in [("rate_limited_429", "429"), ("blocked_403", "403"),
+                                    ("no_player", "failed to extract any player response"),
+                                    ("auth_required", "confirm you"), ("no_formats", "requested format is not available")]:
+                    if term in failure.lower():
+                        indicators.append(label)
+                print(f"REELDROP_DOWNLOAD_FAIL platform=youtube id={code} indicators={','.join(indicators) or 'other'}", flush=True)
+            raise RuntimeError(friendly(failure, platform))
         result = folder / (platform + "_" + code + ".mp4")
         if not result.exists() or not 0 < result.stat().st_size <= 400 * 1024 * 1024:
             raise RuntimeError("Não foi possível obter um arquivo MP4 válido.")
@@ -267,7 +280,7 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return {"status":"ok","service":"ReelDrop","version":"1.3.0","platforms":["instagram","facebook","youtube"]}
+    return {"status":"ok","service":"ReelDrop","version":"1.3.1","platforms":["instagram","facebook","youtube"]}
 
 @app.post("/api/download",status_code=202)
 def download(payload:DownloadRequest, request:Request):
@@ -307,27 +320,6 @@ def file(jobid:str):
     return FileResponse(f,filename=f.name,media_type="video/mp4",
                         background=BackgroundTask(cleanup,jobid),
                         headers={"Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
-
-def youtube_diagnostic_once():
-    """Temporary one-off metadata test for a user-reported public Short."""
-    target = "https://www.youtube.com/shorts/5g83JHxpI8k"
-    cmd = [sys.executable, "-m", "yt_dlp", "--ignore-config", "--no-playlist",
-           "--skip-download", "--print", "id", "--js-runtimes", "node",
-           "--socket-timeout", "12", "--retries", "1", "--",
-           target]
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True,
-                           errors="replace", timeout=60)
-        details = (p.stderr or "").splitlines()
-        print("REELDROP_YOUTUBE_TEST result=" + str(p.returncode), flush=True)
-        for line in details[-24:]:
-            cleaned = re.sub(r"https?://\\S+", "[url]", line)
-            print("REELDROP_YOUTUBE_TEST " + cleaned[:450], flush=True)
-    except Exception as exc:
-        print("REELDROP_YOUTUBE_TEST exception=" + type(exc).__name__, flush=True)
-
-threading.Thread(target=youtube_diagnostic_once, daemon=True).start()
-
 
 PAGE = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
