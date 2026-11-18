@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from diagnostico import chart
 from ntsl import NTSLError, Rolling, SERIES, compile_ntsl
 from simulador import OHLC, read_export, read_ticks, validate_ohlc
 
@@ -416,6 +417,9 @@ def run_strategy(csv, source, output, seconds, format_name, tick, overrides=None
     (output/"estrategia.ntsl").write_text(source,encoding="utf-8")
     table = "".join(f"<tr><th>{html.escape(k.replace('_',' '))}</th><td>{html.escape(str(v))}</td></tr>"
                     for k,v in summary.items() if k!="inputs")
+    sample = sorted(set(np.linspace(0, len(equity)-1, min(len(equity), 350), dtype=int)))
+    payoff = [{"geracao": int(i), "resultado": float(equity[i])} for i in sample]
+    performance = chart(payoff, [("resultado", "Pontos × contratos")], "Resultado realizado", axis="Saída")
     items = '<a href="execucoes.csv">Execuções</a> · <a href="candles.csv">Candles e sinais</a> · <a href="console.csv">Console</a> · <a href="metricas.json">Métricas e inputs</a>'
     (output/"relatorio.html").write_text(f"""<!doctype html><html lang="pt-BR"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Replay NTSL</title>
@@ -423,10 +427,11 @@ def run_strategy(csv, source, output, seconds, format_name, tick, overrides=None
 body{{font:16px system-ui;max-width:850px;margin:3rem auto;padding:0 1.1rem;background:#f2f7f6;color:#172e2b}}
 h1{{font-size:2.3rem}}table{{border-collapse:collapse;width:100%;background:white}}
 th,td{{text-align:left;padding:.6rem 1rem;border-bottom:1px solid #d9e4e1}}a{{color:#146253}}
+figure{{margin:1rem 0;background:white;padding:1rem}} svg{{width:100%;max-height:245px;font-size:11px}}
 </style><h1>Replay NTSL</h1><p>{items}</p>
 <p>O código roda no fechamento de cada candle. Ordens novas só são elegíveis na barra seguinte.
 O resultado é bruto em pontos × contratos. Barras ambíguas podem alterar os preenchimentos.</p>
-<table>{table}</table></html>""",encoding="utf-8")
+{performance}<table>{table}</table></html>""",encoding="utf-8")
     return summary
 
 

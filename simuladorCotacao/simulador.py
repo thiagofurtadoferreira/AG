@@ -17,11 +17,13 @@ import time
 import numpy as np
 import pandas as pd
 
+from diagnostico import BLOCKED, charts, dependencies, labels as make_labels, tree_features
+
 OHLC = ['abertura', 'maxima', 'minima', 'fechamento']
 NUM = r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?'
 GENES = {
     'p_PeriodoMedia', 'p_PeriodoVolatilidade', 'p_PeriodoATR', 'p_PeriodoEficiencia',
-    'p_PeriodoMediaTrades', 'p_BarrasAquecimento', 'p_CorteScoreModelo',
+    'p_PeriodoMediaTrades', 'p_BarrasAquecimento', 'p_CorteScoreModelo', 'p_SegundosPorBarra',
 }
 CHEAP = {'p_BarrasAquecimento', 'p_CorteScoreModelo'}
 
@@ -49,7 +51,8 @@ def read_export(path, seconds):
     new_minute = minute.ne(minute.shift())
     adjacent = minute.diff().eq(pd.Timedelta(minutes=1))
     sequential = frame['v_barra_id'].diff().eq(1)
-    complete_boundary = adjacent & size.eq(capacity) & size.shift().eq(capacity)
+    same_day = minute.dt.normalize().eq(minute.shift().dt.normalize())
+    complete_boundary = adjacent & same_day & size.eq(capacity) & size.shift().eq(capacity)
     boundary = np.where(new_minute, ~complete_boundary, ~sequential)
     frame['segmento'] = np.cumsum(boundary)
     frame['pregao'] = minute.dt.strftime('%Y-%m-%d')
@@ -154,12 +157,18 @@ def divide(top, bottom, default=0):
 
 
 class Replay:
-    def __init__(self, frame, model, seconds, target):
+    def __init__(self, frame, model, seconds, target, specification=None, excluded=()):
         self.frame, self.model, self.seconds = frame, model, seconds
         self.segment = frame['segmento']
         self.age = frame.groupby('segmento', sort=False).cumcount().to_numpy() + 1
-        self.label = frame['classe'].eq(target).fillna(False).to_numpy(dtype=bool)
-        self.valid_label = frame['classe'].notna().to_numpy()
+        self.specification = specification or {}
+        self.excluded = set(excluded) | BLOCKED
+        self.label, self.valid_label = make_labels(frame, target, self.specification)
+        impact = {field for field in model.features if dependencies(field[0][2:]) & self.excluded}
+        self.trees = [tree for tree in model.trees if not (tree_features(tree) & impact)]
+        if not self.trees:
+            raise ValueError('Os campos excluídos afetam todas as árvores. Revise a seleção.')
+        self.features = set().union(*(tree_features(tree) for tree in self.trees))
         self.day = frame['pregao'].to_numpy()
         self.hhmm = (frame['minuto'].dt.hour * 100 + frame['minuto'].dt.minute).to_numpy()
 
@@ -219,7 +228,7 @@ class Replay:
         series = dict(Trades=trades, AbsDelta=delta.abs(), Delta=delta, AbsRet=ret.abs(), Ret=ret,
                       Alta=ret.gt(0).astype(float), Faixa=amplitude.ge(30).astype(float),
                       Classe1C=(amplitude.ge(30) & c.gt(o)).astype(float))
-        for name, k in self.model.features:
+        for name, k in self.features:
             key = name[2:]
             if key not in values:
                 base, window = key.split('M', 1) if re.fullmatch(r'\w+M\d+', key) else ('', '')
@@ -227,11 +236,11 @@ class Replay:
                     raise ValueError(f'Feature NTSL sem implementação: {name}')
                 values[key] = sma(series[base], int(window))
         features = {(name, k): (lag(values[name[2:]], k) if k else values[name[2:]]).to_numpy()
-                    for name, k in self.model.features}
-        valid = np.logical_and.reduce([np.isfinite(v) for v in features.values()])
+                    for name, k in self.features}
+        valid = np.logical_and.reduce([np.isfinite(v) for v in features.values()]) if features else np.ones(len(f), dtype=bool)
         result = np.full(len(f), self.model.bias)
         rows = np.flatnonzero(valid)
-        for tree in self.model.trees:
+        for tree in self.trees:
             add_tree(tree, rows, features, result)
         result[~valid] = np.nan
         return result
@@ -288,10 +297,10 @@ def cpu_count():
     return len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else os.cpu_count() or 1
 
 
-def optimize(replay, config, out):
+def optimize(replay, config, out, on_progress=None):
     cfg = config['genetico']
     names = tuple(config['parametros'])
-    if not names or set(names) - GENES:
+    if not names or set(names) - GENES or set(names) - replay.model.defaults.keys():
         raise ValueError('Selecione parâmetros compatíveis: ' + ', '.join(sorted(GENES)))
     defaults = replay.model.defaults
     pools = [grid(config['parametros'][name], name) for name in names]
@@ -317,11 +326,11 @@ def optimize(replay, config, out):
     for mask in (search, test):
         classes = replay.label[mask]
         if not classes.any() or classes.all():
-            raise ValueError('Busca e teste precisam conter exemplos positivos e negativos da classe.')
+            raise ValueError('Busca e teste precisam conter exemplos positivos e negativos do alvo.')
     splits = {'busca': search, 'teste': test}
     search_rows = replay.day < days[-n_test]
     search_replay = Replay(replay.frame.loc[search_rows].reset_index(drop=True),
-                           replay.model, replay.seconds, config['classe_alvo'])
+                           replay.model, replay.seconds, config.get('classe_alvo', '1C'), replay.specification, replay.excluded)
     local_mask = search[search_rows]
     labels = search_replay.label[local_mask]
     local_age = search_replay.age[local_mask]
@@ -437,7 +446,10 @@ def optimize(replay, config, out):
             else:
                 unchanged += 1
             elapsed = round(time.monotonic()-clock, 2)
-            history.append(dict(geracao=generation, aptidao=best_value, avaliados=len(seen), segundos=elapsed))
+            history.append(dict(geracao=generation, aptidao=best_value, avaliados=len(seen), segundos=elapsed)
+                           | seen[best][1] | dict(zip(names, best)))
+            if on_progress:
+                on_progress(history, names)
             print(f'Geração {generation} | {metric}={best_value:.4f} | {len(seen)} candidatos | {elapsed}s', flush=True)
             if stop_score and best_value >= stop_score:
                 reason = 'meta de desempenho'
@@ -462,9 +474,10 @@ def optimize(replay, config, out):
     pred = predictions(fitted, best_score)
     baseline = predictions(defaults, original_score)
     summary = dict(
-        classe_alvo=config['classe_alvo'], segundos_por_candle=replay.seconds,
+        classe_alvo=config.get('classe_alvo', '1C'), alvo=replay.specification, segundos_por_candle=replay.seconds,
         entradas_na_abertura=True, configuracao=config,
-        arvores=len(replay.model.trees), threads=workers, cache_ram_mb=budget/1024**2,
+        arvores=len(replay.trees), arvores_removidas=len(replay.model.trees)-len(replay.trees),
+        campos_excluidos=sorted(replay.excluded), threads=workers, cache_ram_mb=budget/1024**2,
         metrica=metric, parada=reason, candidatos_avaliados=len(seen), espaco_busca=total,
         segundos_busca=history[-1]['segundos'], atende_min_sinais=best_value >= 0,
         parametros_otimizados=optimized,
@@ -484,34 +497,44 @@ def optimize(replay, config, out):
     candles = replay.frame[columns]
     candles.to_csv(out/'candles.csv', index=False)
     predictions_csv = candles.assign(
-        classe_real=replay.frame['classe'], score_original=original_score, score_otimizado=best_score,
+        classe_real=replay.frame.get('classe'), alvo_real=replay.label, score_original=original_score, score_otimizado=best_score,
         sinal_original=baseline & base_mask, sinal_otimizado=pred & base_mask,
         amostra=np.select([search, test], ['busca', 'teste'], default='fora_do_horario'),
     )
     predictions_csv.loc[base_mask].to_csv(out/'predicoes.csv', index=False)
     warning = ''
-    if best_value >= 0 and config['classe_alvo'] == '1C':
+    if (best_value >= 0 and config.get('classe_alvo', '1C') == '1C'
+            and replay.specification.get('modo', 'classe') == 'classe' and len(replay.trees) == len(replay.model.trees)):
         (out/'modelo_parametrizado.ntsl').write_text(replay.model.patched(optimized), encoding='utf-8')
     elif best_value < 0:
         warning = 'Nenhum candidato cumpriu o mínimo de sinais na busca.'
     else:
-        warning = 'O modelo original foi treinado para 1C. A métrica avalia o score existente para a classe escolhida.'
-    write_html(out, summary, warning)
+        warning = 'A avaliação reaproveita o score do ensemble. A configuração não é exportada como NTSL quando muda o alvo ou remove árvores.'
+    write_html(out, summary, warning, history, names)
     print(f'Relatório: {out/"relatorio.html"}')
 
 
-def write_html(out, summary, warning):
+def write_html(out, summary, warning, history, names):
     rows = []
     for split, result in summary['resultados'].items():
         for version in ('original', 'otimizado'):
             m = result[version]
             rows.append(f'<tr><td>{split}</td><td>{version}</td><td>{m["barras"]}</td>'
-                        f'<td>{m["sinais"]}</td><td>{m["precision"]:.2%}</td>'
+                        f'<td>{m["sinais"]}</td><td>{m["accuracy"]:.2%}</td><td>{m["precision"]:.2%}</td>'
                         f'<td>{m["recall"]:.2%}</td><td>{m["f1"]:.4f}</td>'
                         f'<td>{m["balanced_accuracy"]:.4f}</td>'
                         f'<td>{m["tp"]} / {m["fp"]} / {m["fn"]} / {m["tn"]}</td></tr>')
     detail = html.escape(json.dumps(summary, indent=2, ensure_ascii=False))
-    target = html.escape(summary['classe_alvo'])
+    specification = summary['alvo']
+    mode = specification.get('modo', 'classe')
+    if mode == 'classe':
+        label = f"Classe {summary['classe_alvo']}"
+    elif mode == 'barras':
+        label = f"{specification['lado']} · fechamento de {specification['barras']} barras"
+    else:
+        label = f"{specification['lado']} · toque de {specification['pontos']} pontos em {specification['barras']} barras"
+    target = html.escape(label)
+    graphs = charts(history, names)
     note = html.escape(warning)
     content = f"""<!doctype html>
 <html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -522,15 +545,18 @@ h1{{font-size:2.6rem;letter-spacing:-.04em}} table{{border-collapse:collapse;bac
 th,td{{padding:.75rem;text-align:left;border-bottom:1px solid #dce7e4;white-space:nowrap}}
 th{{background:#153b36;color:white}} pre{{overflow:auto;background:white;padding:1rem}}
 .table{{overflow:auto}} a{{color:#146253}} p{{max-width:75ch}}
+figure{{margin:14px 0;padding:14px;background:white}} svg{{width:100%;max-height:245px;font-size:11px}} .legenda{{font-size:13px}}
 </style>
 <h1>Simulador de Cotação</h1>
-<p>Classe <strong>{target}</strong> · candles de {summary['segundos_por_candle']} s · {summary['candidatos_avaliados']} candidatos</p>
+<p><strong>{target}</strong> · candles de {summary['segundos_por_candle']} s · {summary['candidatos_avaliados']} candidatos</p>
 <p>Parada por {html.escape(summary['parada'])}. {note}</p>
 <p>O teste usa pregões posteriores aos da busca. A matriz está na ordem VP, FP, FN, VN.
 Barras sem score ou em aquecimento contam como ausência de sinal.</p>
 <div class="table"><table><thead><tr><th>Amostra</th><th>Versão</th><th>Barras</th><th>Sinais</th>
-<th>Precisão</th><th>Recall</th><th>F1</th><th>Acurácia balanceada</th><th>VP / FP / FN / VN</th></tr></thead>
+<th>Acurácia</th><th>Precisão</th><th>Recall</th><th>F1</th><th>Acurácia balanceada</th><th>VP / FP / FN / VN</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table></div>
+<h2>Evolução por geração</h2>{graphs}
+<p>Árvores ativas: {summary["arvores"]}. Árvores removidas pelo filtro: {summary["arvores_removidas"]}.</p>
 <p><a href="candles.csv">Candles</a> · <a href="predicoes.csv">Predições</a> · <a href="candidatos.csv">Candidatos</a> ·
 <a href="evolucao.csv">Evolução</a> · <a href="metricas.json">Métricas completas</a></p>
 <details><summary>Configuração e resultados detalhados</summary><pre>{detail}</pre></details></html>"""
@@ -576,7 +602,7 @@ def main():
             frame = read_export(args.csv, seconds)
             validate_ohlc(frame)
             args.saida.mkdir(parents=True, exist_ok=False)
-            optimize(Replay(frame, model, seconds, config['classe_alvo']), config, args.saida)
+            optimize(Replay(frame, model, seconds, config.get('classe_alvo', '1C'), config.get('alvo'), config.get('campos_excluidos', ())), config, args.saida)
     except (OSError, ValueError, KeyError, TypeError, AttributeError, ArithmeticError) as error:
         parser.exit(2, f'Erro: {error}\n')
 

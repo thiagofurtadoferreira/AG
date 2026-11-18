@@ -20,6 +20,13 @@ button:disabled{opacity:.55;cursor:default}.primary{background:var(--accent);col
 .actions{display:flex;flex-wrap:wrap;gap:9px;margin:12px 0}.top{display:flex;justify-content:space-between;align-items:start;gap:10px}
 #situacao{white-space:pre-wrap;overflow-wrap:anywhere}a{color:var(--accent);font-weight:650}
 @media(max-width:700px){form{grid-template-columns:1fr}header{padding-top:26px}}
+[hidden]{display:none!important}.grid-scroll{overflow:auto;max-height:340px}
+table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:7px;border-bottom:1px solid var(--line)}
+td input[type=number]{min-width:76px}input[type=checkbox]{width:auto;display:inline}
+#campos{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));max-height:240px;overflow:auto;gap:5px}
+#campos label{font-weight:400;overflow-wrap:anywhere}details{margin:12px 0}summary{cursor:pointer;font-weight:650}
+figure{margin:10px 0;background:#f5f9f8;padding:12px;border-radius:8px}svg{width:100%;max-height:235px;font-size:11px}
+.legenda{font-size:13px}
 </style>
 </head>
 <body>
@@ -46,15 +53,132 @@ button:disabled{opacity:.55;cursor:default}.primary{background:var(--accent);col
 <section class="panel options">
 <h2>Execução</h2>
 <div class="field"><label for="modo">Modo</label><select id="modo"><option value="estrategia">Replay da estratégia</option><option value="otimizar">Otimização genética do ensemble</option></select></div>
+<div id="genetica" hidden>
+<div class="split">
+<div><label for="alvo">Alvo</label><select id="alvo"><option value="classe">Classe do CSV</option><option value="barras">Direção após N barras</option><option value="pontos">Toque de pontos em N barras</option></select></div>
+<div id="classe-wrap"><label for="classe">Classe positiva</label><input id="classe" value="1C"></div>
+<div id="lado-wrap" hidden><label for="lado">Direção</label><select id="lado"><option value="compra">Compra</option><option value="venda">Venda</option></select></div>
+<div id="barras-wrap" hidden><label for="barras">Barras incluindo a atual</label><input id="barras" type="number" min="1" max="100000" value="5"></div>
+<div id="pontos-wrap" hidden><label for="pontos">Distância em pontos</label><input id="pontos" type="number" step="any" min="0.000001" value="30"></div>
+</div>
+<h3>Parâmetros do código NTSL</h3>
+<div class="grid-scroll"><table><thead><tr><th>Input</th><th>Original</th><th>Testar</th><th>Mínimo</th><th>Máximo</th><th>Passo</th></tr></thead><tbody id="parametros"></tbody></table></div>
+<small>As faixas sugeridas são editáveis. Inputs apenas informativos ficam desabilitados.</small>
+<details><summary>Campos excluídos das entradas do modelo</summary>
+<small>Classe, tipo de ordem e rótulo de amplitude são protegidos. Exclusões adicionais desativam árvores dependentes. O alvo e o horário continuam sendo calculados.</small><div id="campos"></div></details>
+</div>
 <div class="field"><label for="opcoes" id="titulo-opcoes">Substituição de inputs (JSON)</label><textarea id="opcoes" spellcheck="false">{}</textarea><small id="ajuda-opcoes">Use {} para aplicar os valores do código. Exemplo de ajuste: {"p_Lote": 2}.</small></div>
 <div class="actions"><button class="primary" id="executar" type="submit">Executar</button></div>
 </section>
-<section class="panel result"><h2>Resultado</h2><p id="situacao" role="status" aria-live="polite">Aguardando dados e estratégia.</p><a id="relatorio" hidden target="_blank" rel="noopener">Abrir relatório</a></section>
+<section class="panel result"><h2>Resultado</h2><p id="situacao" role="status" aria-live="polite">Aguardando dados e estratégia.</p><div id="andamento"></div><a id="relatorio" hidden target="_blank" rel="noopener">Abrir relatório</a></section>
 </form>
 </main>
 <script>
 const $ = id => document.getElementById(id);
 let running = false, timer = null, optimizationTemplate = null, replaySettings = "{}";
+const protectedFields = ["classe","tipo_ordem","pts_maior_30"];
+const supported = new Set(["p_PeriodoMedia","p_PeriodoVolatilidade","p_PeriodoATR","p_PeriodoEficiencia","p_PeriodoMediaTrades","p_BarrasAquecimento","p_CorteScoreModelo","p_SegundosPorBarra"]);
+let columns = [];
+const genetic = () => $("modo").value === "otimizar";
+const config = () => JSON.parse($("opcoes").value);
+function updateConfig(edit) {
+    try {
+        const settings = config();
+        edit(settings);
+        $("opcoes").value = JSON.stringify(settings,null,2);
+    } catch (error) { show("Corrija o JSON para aplicar os ajustes. " + error.message); }
+}
+function renderInputs(settings) {
+    const body = $("parametros");
+    body.replaceChildren();
+    const code = $("ntsl").value.replace(/\{[^}]*\}|\(\*[\s\S]*?\*\)|\/\/[^\n]*/g,"");
+    const section = code.match(/\binput\b([\s\S]*?)(?=\b(?:var|const|begin|function|procedure)\b|$)/i);
+    for (const [,name,initial] of (section?.[1] ?? "").matchAll(/([a-z_]\w*)\s*\(\s*([^();]+)\s*\)\s*;/gi)) {
+        const key = [...supported].find(item => item.toLowerCase() === name.toLowerCase()) ?? name;
+        const enabled = supported.has(key) && Number.isFinite(Number(initial));
+        const original = Number(initial);
+        const suggested = key === "p_CorteScoreModelo"
+            ? {min:Number((original-.5).toFixed(4)),max:Number((original+.5).toFixed(4)),passo:.05}
+            : {min:Math.max(1,Math.floor(original*.65)),max:Math.max(2,Math.ceil(original*1.5)),passo:Math.max(1,Math.round(original*.1))};
+        const active = settings.parametros?.[key];
+        const range = active ?? suggested;
+        const row = body.insertRow();
+        row.insertCell().textContent = name;
+        row.insertCell().textContent = initial;
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox"; checkbox.disabled = !enabled; checkbox.checked = Boolean(active);
+        checkbox.setAttribute("aria-label","Testar "+name);
+        const cell = row.insertCell();
+        cell.append(enabled ? checkbox : document.createTextNode("Informativo"));
+        const inputs = {};
+        for (const part of ["min","max","passo"]) {
+            const cell = row.insertCell();
+            if (!enabled) continue;
+            const field = document.createElement("input");
+            field.type = "number"; field.step = "any"; field.value = range[part];
+            field.setAttribute("aria-label",part+" "+name);
+            field.disabled = !checkbox.checked;
+            cell.append(field); inputs[part] = field;
+        }
+        function save() {
+            updateConfig(s => {
+                s.parametros ??= {};
+                if (checkbox.checked) {
+                    if (Object.values(inputs).some(field => field.value === "")) throw Error("Preencha a faixa de "+name);
+                    s.parametros[key] = Object.fromEntries(Object.entries(inputs).map(([part,field]) => [part,Number(field.value)]));
+                } else delete s.parametros[key];
+            });
+        }
+        checkbox.addEventListener("change",() => {
+            for (const field of Object.values(inputs)) field.disabled = !checkbox.checked;
+            save();
+        });
+        for (const field of Object.values(inputs)) field.addEventListener("change",save);
+    }
+}
+function renderGenetic() {
+    if (!genetic()) return;
+    let settings;
+    try { settings = config(); } catch { return; }
+    $("alvo").value = settings.alvo?.modo ?? "classe";
+    $("classe").value = settings.classe_alvo ?? "1C";
+    $("lado").value = settings.alvo?.lado ?? "compra";
+    $("barras").value = settings.alvo?.barras ?? 5;
+    $("pontos").value = settings.alvo?.pontos ?? 30;
+    $("classe-wrap").hidden = $("alvo").value !== "classe";
+    $("lado-wrap").hidden = $("barras-wrap").hidden = $("alvo").value === "classe";
+    $("pontos-wrap").hidden = $("alvo").value !== "pontos";
+    renderInputs(settings);
+    $("campos").replaceChildren();
+    for (const name of new Set([...protectedFields,...columns])) {
+        const label = document.createElement("label"), field = document.createElement("input");
+        field.type = "checkbox";
+        field.disabled = protectedFields.includes(name);
+        field.checked = field.disabled || (settings.campos_excluidos ?? []).includes(name);
+        field.addEventListener("change",() => updateConfig(s => {
+            const selected = new Set(s.campos_excluidos ?? protectedFields);
+            if (field.checked) selected.add(name); else selected.delete(name);
+            s.campos_excluidos = [...selected];
+        }));
+        label.append(field, " "+name); $("campos").append(label);
+    }
+}
+for (const id of ["alvo","classe","lado","barras","pontos"]) $(id).addEventListener("change",() => {
+    updateConfig(s => {
+        s.classe_alvo = $("classe").value;
+        s.alvo = {modo:$("alvo").value,lado:$("lado").value,barras:Number($("barras").value),pontos:Number($("pontos").value)};
+    });
+    renderGenetic();
+});
+$("csv").addEventListener("change",async () => {
+    const file = $("csv").files[0];
+    const head = file ? (await file.slice(0,65536).text()).split(/\r?\n/,1)[0] : "";
+    if (file !== $("csv").files[0]) return;
+    columns = head.split(";").map(item => item.trim().replace(/^"|"$/g,"")).filter(Boolean);
+    renderGenetic();
+});
+$("opcoes").addEventListener("change",renderGenetic);
+$("ntsl").addEventListener("change",renderGenetic);
 const endpoint = name => new URL(name, window.location.href);
 const show = message => { $("situacao").textContent = message; };
 const busy = active => {
@@ -75,6 +199,7 @@ $("arquivo").addEventListener("change", async () => {
         const bytes = await file.arrayBuffer();
         try { $("ntsl").value = new TextDecoder("utf-8",{fatal:true}).decode(bytes); }
         catch { $("ntsl").value = new TextDecoder("windows-1252").decode(bytes); }
+        renderGenetic();
     } catch (error) { show(error.message); }
 });
 $("modelo").addEventListener("click", async () => {
@@ -82,6 +207,7 @@ $("modelo").addEventListener("click", async () => {
         const response = await fetch(endpoint("modelo-exemplo"));
         if (!response.ok) throw Error("Falha ao abrir a estratégia do pacote.");
         $("ntsl").value = await response.text();
+        renderGenetic();
     } catch (error) { show(error.message); }
 });
 $("modo").addEventListener("change", async () => {
@@ -99,6 +225,8 @@ $("modo").addEventListener("change", async () => {
         optimizationTemplate = $("opcoes").value;
         $("opcoes").value = replaySettings;
     }
+    $("genetica").hidden = !optimize;
+    renderGenetic();
     $("titulo-opcoes").textContent = optimize ? "Configuração genética (JSON)" : "Substituição de inputs (JSON)";
     $("ajuda-opcoes").textContent = optimize
         ? "Selecione o CSV do indicador Profit. Este modo usa o formato de árvores do modelo fornecido."
@@ -109,6 +237,10 @@ async function poll() {
         const response = await fetch(endpoint("estado"));
         const state = await response.json();
         if (state.estado === "executando") {
+            if (state.geracao) {
+                show("Geração " + state.geracao + " · " + state.avaliados + " candidatos avaliados");
+                $("andamento").innerHTML = state.graficos;
+            }
             timer = setTimeout(poll,1200);
         } else {
             busy(false);
@@ -127,6 +259,7 @@ $("form").addEventListener("submit", async event => {
     if (running) return;
     busy(true);
     $("relatorio").hidden = true;
+    $("andamento").replaceChildren();
     try {
         const options = {
             modo:$("modo").value, csv:$("csv").files[0].name, ntsl:$("ntsl").value,

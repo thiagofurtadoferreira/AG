@@ -1,5 +1,12 @@
 # Histórico de versões
 
+## 0.3.0
+
+- Tabela de inputs NTSL com seleção e faixas sugeridas.
+- Alvos de classe, direção no fechamento de N barras e toque de pontos dentro de N barras.
+- Seleção de colunas excluídas e filtro de árvores dependentes.
+- Gráficos de busca ao vivo e no relatório e curva de resultado do replay.
+
 ## 0.2.1
 
 - Detecção automática de CSV do Profit, negócios ou candles OHLC pelo cabeçalho.

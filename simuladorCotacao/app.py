@@ -15,6 +15,7 @@ from threading import Lock, Thread
 from urllib.parse import urlsplit
 import webbrowser
 
+from diagnostico import charts
 from estrategia import csv_format, main as strategy_cli, run_strategy
 from simulador import NTSLModel, Replay, main as simulator_cli, optimize, read_export, validate_ohlc
 
@@ -110,7 +111,13 @@ class Workspace:
                 frame = read_export(csv,seconds)
                 validate_ohlc(frame)
                 destination.mkdir()
-                optimize(Replay(frame,model,seconds,config["classe_alvo"]),config,destination)
+                replay = Replay(frame, model, seconds, config.get("classe_alvo", "1C"),
+                                config.get("alvo"), config.get("campos_excluidos", ()))
+                def progress(history, names):
+                    latest = history[-1]
+                    self.job = {"estado": "executando", "id": name, "geracao": latest["geracao"],
+                                "avaliados": latest["avaliados"], "graficos": charts(history[-100:], names)}
+                optimize(replay, config, destination, progress)
             else:
                 raise ValueError("Modo de execução desconhecido.")
         except Exception as error:

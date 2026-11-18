@@ -1,4 +1,4 @@
-# simuladorCotacao 0.2.1
+# simuladorCotacao 0.3.0
 
 ## Abrir no Windows
 
@@ -63,6 +63,22 @@ Use **Otimização genética do ensemble**, o CSV de indicador rotulado e um NTS
 
 O replay aceita o subconjunto NTSL descrito acima. A otimização genética desta versão opera sobre o classificador de árvores. Veja [README-otimizador.md](README-otimizador.md) para o formato e os parâmetros suportados.
 
+### Parâmetros, alvos e acompanhamento
+
+Ao carregar o código, a interface lista os inputs declarados, os valores originais e as faixas iniciais sugeridas para os genes suportados. Marque **Testar** e ajuste mínimo, máximo e passo. A tabela atualiza o JSON. Inputs operacionais sem efeito no classificador ficam como informativos. Além dos genes anteriores, é possível calibrar `p_SegundosPorBarra`, divisor de aceleração do modelo, independentemente da resolução efetiva do CSV.
+
+| Alvo | Regra |
+|---|---|
+| Classe do CSV | Valor exato da coluna `classe` na barra de previsão |
+| Direção após N barras | Compara o fechamento da N-ésima barra com a abertura da barra de previsão. Compra exige valorização e venda exige queda |
+| Toque de pontos em N barras | Compra exige máxima pelo menos X pontos acima da abertura. Venda exige mínima pelo menos X pontos abaixo |
+
+A contagem inclui a barra em cuja abertura o sinal é emitido. Mesmo em velas de 1 s, janelas sem N barras contíguas no mesmo pregão ficam fora da avaliação. Um toque é um rótulo de preço, sem pressupor preenchimento de ordem. O ensemble existente é recalibrado para o alvo selecionado.
+
+`classe`, `tipo_ordem` e `pts_maior_30` ficam protegidos como entradas. A coluna `classe` pode continuar sendo o rótulo. A seção **Campos excluídos** mostra as colunas do CSV. Ao excluir um campo usado no cálculo de features, o programa remove as árvores que dependem dele segundo o mapa de dependências do ensemble. O relatório informa a quantidade removida. OHLC e campos de identificação ainda podem ser usados para formar os rótulos, ordenar os candles ou filtrar o horário. Os rótulos futuros ficam fora dos preditores. Na abertura, as árvores usam features defasadas e o gap da abertura atual.
+
+Os gráficos ao vivo mostram o melhor candidato da busca por geração. O relatório exportado inclui acurácia, precisão dos sinais, recall, F1, acurácia balanceada e os valores de cada gene selecionado. A tabela final compara busca e teste cronológico. O replay de estratégia ganhou curva de resultado realizado. O arquivo `evolucao.csv` guarda os dados dos gráficos genéticos.
+
 ## Linha de comando
 
 No PowerShell, abra a pasta extraída:
@@ -82,7 +98,7 @@ Em Linux, use Python 3.11+ e um toolchain MinGW-w64 x64. Baixe a distribuição 
 
 ```bash
 python -m pip download --only-binary=:all: --platform win_amd64 --python-version 312 -r windows/requirements.lock -d wheels
-python windows/package.py --python-win python-3.12.10-embed-amd64.zip --wheels wheels --saida simuladorCotacao-v0.2.1-win64.zip
+python windows/package.py --python-win python-3.12.10-embed-amd64.zip --wheels wheels --saida simuladorCotacao-v0.3.0-win64.zip
 ```
 
 Para desenvolver ou testar com o seu Python local, instale `requirements.txt` e rode `python app.py`. Para um comando de terminal no código-fonte, use `python app.py --cli estrategia --help`.
