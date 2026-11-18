@@ -1,5 +1,10 @@
 # Histórico de versões
 
+## 0.2.1
+
+- Detecção automática de CSV do Profit, negócios ou candles OHLC pelo cabeçalho.
+- Mensagens orientam a corrigir o formato quando a seleção manual é incompatível.
+
 ## 0.2.0
 
 - Aplicativo portátil Windows x64 com dois executáveis, interface local no navegador e CLI.

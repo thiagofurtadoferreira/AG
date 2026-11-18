@@ -1,10 +1,10 @@
-# simuladorCotacao 0.2.0
+# simuladorCotacao 0.2.1
 
 ## Abrir no Windows
 
 1. Extraia **todo o ZIP** para uma pasta gravável.
 2. Execute **SimuladorCotacao.exe**. A interface abre no navegador padrão, em endereço local da própria máquina. O runtime acompanha o programa.
-3. Selecione o CSV, escolha o formato, informe o intervalo e carregue um arquivo NTSL ou cole o código do Profit.
+3. Selecione o CSV, mantenha a detecção automática de formato, informe o intervalo e carregue um arquivo NTSL ou cole o código do Profit.
 4. Use **Replay da estratégia** e clique em **Executar**. Use **Abrir relatório** quando terminar.
 5. Use **Encerrar aplicativo** para fechar o processo local. Os arquivos de saída ficam em `%USERPROFILE%\simuladorCotacao\resultados`.
 
@@ -82,7 +82,7 @@ Em Linux, use Python 3.11+ e um toolchain MinGW-w64 x64. Baixe a distribuição 
 
 ```bash
 python -m pip download --only-binary=:all: --platform win_amd64 --python-version 312 -r windows/requirements.lock -d wheels
-python windows/package.py --python-win python-3.12.10-embed-amd64.zip --wheels wheels --saida simuladorCotacao-v0.2.0-win64.zip
+python windows/package.py --python-win python-3.12.10-embed-amd64.zip --wheels wheels --saida simuladorCotacao-v0.2.1-win64.zip
 ```
 
 Para desenvolver ou testar com o seu Python local, instale `requirements.txt` e rode `python app.py`. Para um comando de terminal no código-fonte, use `python app.py --cli estrategia --help`.

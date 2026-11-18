@@ -1,5 +1,6 @@
 """Replay local de estratégias NTSL por candle."""
 import argparse
+import csv
 from dataclasses import dataclass
 import hashlib
 import html
@@ -20,6 +21,32 @@ def source_text(path):
         return data.decode("utf-8-sig")
     except UnicodeDecodeError:
         return data.decode("cp1252")
+
+
+FORMATS = {
+    "profit": ("Indicador exportado do Profit", {"data_minuto_origem", "v_barra_id", *OHLC}),
+    "ohlc": ("Candles OHLC com timestamp", {"timestamp", *OHLC}),
+    "negocios": ("Negócios com timestamp", {"timestamp", "preco"}),
+}
+
+
+def csv_format(path, requested="auto"):
+    with Path(path).open(encoding="utf-8-sig", newline="") as stream:
+        columns = set(next(csv.reader(stream, delimiter=";"), []))
+    detected = next((key for key, (_, required) in FORMATS.items() if required <= columns), None)
+    if requested == "auto":
+        if detected:
+            return detected
+        raise ValueError("Formato do CSV não reconhecido. Confira os nomes das colunas e o separador ponto e vírgula.")
+    if requested not in FORMATS:
+        raise ValueError(f"Formato desconhecido: {requested}.")
+    label, required = FORMATS[requested]
+    if required <= columns:
+        return requested
+    if detected:
+        raise ValueError(f'O CSV corresponde a “{FORMATS[detected][0]}”. Selecione esse formato ou “Detectar automaticamente”.')
+    missing = ", ".join(sorted(required - columns))
+    raise ValueError(f'Colunas ausentes no formato “{label}”: {missing}. Confira o separador ponto e vírgula.')
 
 
 def load_bars(path, seconds, format_name):
@@ -356,6 +383,7 @@ class Engine:
 
 def run_strategy(csv, source, output, seconds, format_name, tick, overrides=None, point_value=1):
     program = compile_ntsl(source)
+    format_name = csv_format(csv, format_name)
     frame = load_bars(csv,seconds,format_name)
     engine = Engine(program,frame,tick,overrides or {},seconds,point_value)
     engine.run()
@@ -379,7 +407,8 @@ def run_strategy(csv, source, output, seconds, format_name, tick, overrides=None
                    preenchimentos=len(fills),saidas=len(exits),saidas_positivas=int((pnl>0).sum()),
                    saidas_negativas=int((pnl<0).sum()),pontos_contrato=engine.realized,
                    drawdown_pontos_contrato=float((np.maximum.accumulate(equity)-equity).max()),
-                   barras_ambiguas=engine.ambiguities,intervalo_segundos=seconds,tick=tick,
+                   barras_ambiguas=engine.ambiguities,formato_csv=FORMATS[format_name][0],
+                   intervalo_segundos=seconds,tick=tick,
                    valor_por_ponto=point_value,resultado_bruto_convertido=engine.realized*point_value,
                    inputs=program.inputs|{k.lower():v for k,v in (overrides or {}).items()},
                    usa_asset_snapshot=engine.ignored_asset)
@@ -407,7 +436,7 @@ def main():
     p.add_argument("--ntsl",required=True)
     p.add_argument("--saida",required=True)
     p.add_argument("--segundos",type=int,required=True)
-    p.add_argument("--formato",choices=["profit","negocios","ohlc"],required=True)
+    p.add_argument("--formato",choices=["auto", "profit", "negocios", "ohlc"],default="auto")
     p.add_argument("--tick",type=float,default=5)
     p.add_argument("--valor-ponto",type=float,default=1,help="Multiplicador de DailyResult e do resultado bruto")
     p.add_argument("--inputs",help="Arquivo JSON com valores de inputs a substituir")

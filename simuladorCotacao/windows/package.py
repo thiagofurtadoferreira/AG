@@ -7,8 +7,8 @@ import subprocess
 import tempfile
 from zipfile import ZipFile, ZIP_DEFLATED
 
-VERSION = "0.2.0"
 PROJECT = Path(__file__).resolve().parents[1]
+VERSION = (PROJECT/"VERSION").read_text().strip()
 FILES = ("app.py", "estrategia.py", "ntsl.py", "interface.html", "simulador.py",
          "modelo_profit.ntsl", "config_v6.json", "config_v7.json", "README.md",
          "CHANGELOG.md", "README-otimizador.md", "requirements.txt", "VERSION", "exemplo_cruzamento.ntsl")

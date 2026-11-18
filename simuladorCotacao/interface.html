@@ -29,7 +29,7 @@ button:disabled{opacity:.55;cursor:default}.primary{background:var(--accent);col
 <section class="panel">
 <h2>Dados</h2>
 <div class="field"><label for="csv">CSV de entrada</label><input id="csv" type="file" accept=".csv,text/csv" required></div>
-<div class="field"><label for="formato">Formato</label><select id="formato"><option value="profit">Indicador exportado do Profit</option><option value="negocios">Negócios com timestamp</option><option value="ohlc">Candles OHLC com timestamp</option></select></div>
+<div class="field"><label for="formato">Formato</label><select id="formato"><option value="auto">Detectar automaticamente</option><option value="profit">Indicador exportado do Profit</option><option value="negocios">Negócios com timestamp</option><option value="ohlc">Candles OHLC com timestamp</option></select></div>
 <div class="split">
 <div><label for="segundos">Candle em segundos</label><input type="number" id="segundos" value="5" min="1" required></div>
 <div><label for="tick">Incremento de preço</label><input type="number" id="tick" value="5" min="0.000001" step="any" required></div>

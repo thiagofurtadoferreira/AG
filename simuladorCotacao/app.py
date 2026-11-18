@@ -15,7 +15,7 @@ from threading import Lock, Thread
 from urllib.parse import urlsplit
 import webbrowser
 
-from estrategia import main as strategy_cli, run_strategy
+from estrategia import csv_format, main as strategy_cli, run_strategy
 from simulador import NTSLModel, Replay, main as simulator_cli, optimize, read_export, validate_ohlc
 
 APP = Path(__file__).resolve().parent
@@ -95,7 +95,10 @@ class Workspace:
             if options["modo"] == "estrategia":
                 run_strategy(csv,options["ntsl"], destination,int(options["segundos"]),
                              options["formato"],float(options["tick"]),options["opcoes"],float(options.get("valor_ponto",1)))
-            elif options["modo"] == "otimizar" and options["formato"] == "profit":
+            elif options["modo"] == "otimizar":
+                requested = options["formato"]
+                if csv_format(csv, requested) != "profit":
+                    raise ValueError("A otimização do ensemble requer CSV de indicador Profit.")
                 config = options["opcoes"]
                 with tempfile.TemporaryDirectory() as tmp:
                     path = Path(tmp)/"estrategia.ntsl"
@@ -109,7 +112,7 @@ class Workspace:
                 destination.mkdir()
                 optimize(Replay(frame,model,seconds,config["classe_alvo"]),config,destination)
             else:
-                raise ValueError("A otimização do ensemble requer CSV de indicador Profit.")
+                raise ValueError("Modo de execução desconhecido.")
         except Exception as error:
             self.job = {"estado":"erro","mensagem":str(error),"id":name}
         else:

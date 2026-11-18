@@ -1,6 +1,6 @@
 1 VERSIONINFO
-FILEVERSION 0,2,0,0
-PRODUCTVERSION 0,2,0,0
+FILEVERSION 0,2,1,0
+PRODUCTVERSION 0,2,1,0
 FILEFLAGSMASK 0x3fL
 FILEOS 0x00040004L
 FILETYPE 0x00000001L
@@ -10,9 +10,9 @@ BEGIN
     BLOCK "041604B0"
     BEGIN
       VALUE "FileDescription", "Simulador de Cotacao - Replay NTSL"
-      VALUE "FileVersion", "0.2.0"
+      VALUE "FileVersion", "0.2.1"
       VALUE "ProductName", "simuladorCotacao"
-      VALUE "ProductVersion", "0.2.0"
+      VALUE "ProductVersion", "0.2.1"
     END
   END
   BLOCK "VarFileInfo"
