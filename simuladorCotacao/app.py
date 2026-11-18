@@ -16,12 +16,12 @@ from urllib.parse import urlsplit
 import webbrowser
 
 from diagnostico import charts
-from estrategia import csv_format, main as strategy_cli, run_strategy
+from estrategia import csv_format, main as strategy_cli, run_strategy, strategy_replay
 from simulador import NTSLModel, Replay, main as simulator_cli, optimize, read_export, validate_ohlc
 
 APP = Path(__file__).resolve().parent
 VERSION = (APP/"VERSION").read_text().strip()
-REPORTS = {"relatorio.html", "execucoes.csv", "candles.csv", "console.csv", "metricas.json",
+REPORTS = {"relatorio.html", "execucoes.csv", "candles.csv", "console.csv", "metricas.json", "inputs_otimizados.json",
            "estrategia.ntsl", "predicoes.csv", "evolucao.csv", "candidatos.csv", "modelo_parametrizado.ntsl"}
 MIB = 1024**2
 
@@ -98,25 +98,29 @@ class Workspace:
                              options["formato"],float(options["tick"]),options["opcoes"],float(options.get("valor_ponto",1)))
             elif options["modo"] == "otimizar":
                 requested = options["formato"]
-                if csv_format(csv, requested) != "profit":
-                    raise ValueError("A otimização do ensemble requer CSV de indicador Profit.")
                 config = options["opcoes"]
-                with tempfile.TemporaryDirectory() as tmp:
-                    path = Path(tmp)/"estrategia.ntsl"
-                    path.write_text(options["ntsl"],encoding="utf-8")
-                    model = NTSLModel(path)
                 config["segundos_por_candle"] = int(options["segundos"])
                 config["versao"] = VERSION
                 seconds = config["segundos_por_candle"]
-                frame = read_export(csv,seconds)
-                validate_ohlc(frame)
+                if config.get("motor") == "ntsl":
+                    replay = strategy_replay(csv, options["ntsl"], seconds, requested, config,
+                                             float(options["tick"]), float(options.get("valor_ponto",1)))
+                else:
+                    if csv_format(csv, requested) != "profit":
+                        raise ValueError("A otimização do ensemble requer CSV de indicador Profit.")
+                    with tempfile.TemporaryDirectory() as tmp:
+                        path = Path(tmp)/"estrategia.ntsl"
+                        path.write_text(options["ntsl"],encoding="utf-8")
+                        model = NTSLModel(path)
+                    frame = read_export(csv,seconds)
+                    validate_ohlc(frame)
+                    replay = Replay(frame, model, seconds, config.get("classe_alvo", "1C"),
+                                    config.get("alvo"), config.get("campos_excluidos", ()))
                 destination.mkdir()
-                replay = Replay(frame, model, seconds, config.get("classe_alvo", "1C"),
-                                config.get("alvo"), config.get("campos_excluidos", ()))
                 def progress(history, names):
                     latest = history[-1]
                     self.job = {"estado": "executando", "id": name, "geracao": latest["geracao"],
-                                "avaliados": latest["avaliados"], "graficos": charts(history[-100:], names)}
+                                "avaliados": latest["avaliados"], "graficos": charts(history[-100:], names, financial=replay.specification.get("modo")=="resultado")}
                 optimize(replay, config, destination, progress)
             else:
                 raise ValueError("Modo de execução desconhecido.")

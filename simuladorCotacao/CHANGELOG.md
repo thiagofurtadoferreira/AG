@@ -1,5 +1,11 @@
 # Histórico de versões
 
+## 0.4.0
+
+- Busca genética por execução NTSL com faixas para todos os inputs, incluindo listas booleanas e de texto, e objetivos de resultado e drawdown.
+- Linguagem ampliada com laços, arrays, rotinas escalares, funções matemáticas e de volatilidade, SendOrder e ReversePosition.
+- Relatórios com P&L e drawdown, exportação dos inputs e manutenção do classificador de abertura anterior.
+
 ## 0.3.0
 
 - Tabela de inputs NTSL com seleção e faixas sugeridas.

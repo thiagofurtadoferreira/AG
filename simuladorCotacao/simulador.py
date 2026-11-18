@@ -279,11 +279,27 @@ def metrics(y, prediction):
                 accuracy=rate(tp+tn, len(y)), cobertura=rate(tp+fp, len(y)))
 
 
-def grid(spec, name):
+def grid(spec, name, initial=None, generic=False):
+    if generic and "valores" in spec:
+        raw = spec["valores"]
+        if not isinstance(raw, list) or not raw or len(raw)>100_000 or any(
+            type(item) not in {str, bool, int, float} or
+            (type(item) in {int, float} and not math.isfinite(item)) for item in raw
+        ):
+            raise ValueError(f"Lista de valores inválida para {name}.")
+        if isinstance(initial,str) and any(not isinstance(item,str) for item in raw):
+            raise ValueError(f"{name} requer valores de texto.")
+        if isinstance(initial,bool) and any(not isinstance(item,bool) for item in raw):
+            raise ValueError(f"{name} requer true/false na lista de valores.")
+        if type(initial) in {float,int} and any(type(item) not in {float,int} for item in raw):
+            raise ValueError(f"{name} requer valores numéricos.")
+        return tuple(dict.fromkeys(raw))
+    if generic and isinstance(initial,(bool,str)):
+        raise ValueError(f"{name} requer uma lista 'valores'.")
     lo, hi, step = (Decimal(str(spec[key])) for key in ('min', 'max', 'passo'))
     if not all(x.is_finite() for x in (lo, hi, step)) or step <= 0 or lo > hi:
         raise ValueError(f'Faixa inválida para {name}.')
-    integer = name != 'p_CorteScoreModelo'
+    integer = not generic and name != 'p_CorteScoreModelo'
     if integer and (lo < 1 or any(v != int(v) for v in (lo, hi, step))):
         raise ValueError(f'{name} requer faixa inteira positiva.')
     size = int((hi-lo)//step) + 1
@@ -299,11 +315,18 @@ def cpu_count():
 
 def optimize(replay, config, out, on_progress=None):
     cfg = config['genetico']
+    generic = not isinstance(replay, Replay)
+    defaults = replay.defaults if generic else replay.model.defaults
     names = tuple(config['parametros'])
-    if not names or set(names) - GENES or set(names) - replay.model.defaults.keys():
-        raise ValueError('Selecione parâmetros compatíveis: ' + ', '.join(sorted(GENES)))
-    defaults = replay.model.defaults
-    pools = [grid(config['parametros'][name], name) for name in names]
+    keys = tuple(name.lower() for name in names) if generic else names
+    if not names or len(set(keys)) != len(names):
+        raise ValueError('Selecione pelo menos um input e evite nomes duplicados.')
+    if set(keys) - defaults.keys():
+        raise ValueError('Inputs ausentes no NTSL: ' + ', '.join(sorted(set(keys)-defaults.keys())))
+    if not generic and set(names) - GENES:
+        raise ValueError('Use o motor NTSL completo para otimizar esses inputs.')
+    pools = [grid(config['parametros'][name], name, defaults[key], generic)
+             for name, key in zip(names, keys)]
     total = math.prod(map(len, pools))
     population = min(int(cfg['populacao']), total)
     generations, patience = (int(cfg[key]) for key in ('geracoes', 'paciencia'))
@@ -312,28 +335,31 @@ def optimize(replay, config, out, on_progress=None):
     seconds = float(cfg.get('limite_segundos') or 0)
     mutation = float(cfg.get('mutacao', .25))
     metric = cfg.get('metrica', 'f1')
+    financial = metric in {'resultado','resultado_menos_drawdown'}
     if (min(generations, population) < 1 or min(patience, minimum_signals, seconds) < 0
-            or not 0 <= mutation <= 1 or not 0 <= stop_score <= 1
-            or metric not in {'f1', 'balanced_accuracy', 'precision', 'recall', 'accuracy'}):
+            or not 0 <= mutation <= 1 or not math.isfinite(stop_score)
+            or (not financial and not 0 <= stop_score <= 1)
+            or (financial and not generic)
+            or metric not in {'f1', 'balanced_accuracy', 'precision', 'recall', 'accuracy', 'resultado', 'resultado_menos_drawdown'}):
         raise ValueError('Configuração genética inválida.')
     days = np.unique(replay.day)
     n_test = int(config['pregoes_teste'])
     if not 1 <= n_test < len(days):
         raise ValueError('Reserve pelo menos um pregão de busca e um de teste.')
-    base_mask = replay.eligible(1)
+    base_mask = replay.valid_label if generic else replay.eligible(1)
     search = base_mask & (replay.day < days[-n_test])
     test = base_mask & (replay.day >= days[-n_test])
     for mask in (search, test):
         classes = replay.label[mask]
-        if not classes.any() or classes.all():
+        if not financial and (not classes.any() or classes.all()):
             raise ValueError('Busca e teste precisam conter exemplos positivos e negativos do alvo.')
     splits = {'busca': search, 'teste': test}
     search_rows = replay.day < days[-n_test]
-    search_replay = Replay(replay.frame.loc[search_rows].reset_index(drop=True),
+    search_replay = replay.subset(search_rows) if generic else Replay(replay.frame.loc[search_rows].reset_index(drop=True),
                            replay.model, replay.seconds, config.get('classe_alvo', '1C'), replay.specification, replay.excluded)
     local_mask = search[search_rows]
     labels = search_replay.label[local_mask]
-    local_age = search_replay.age[local_mask]
+    local_age = None if generic else search_replay.age[local_mask]
 
     n = len(search_replay.frame)
     budget = int(config['cache_ram_mb']) * 1024**2
@@ -350,7 +376,7 @@ def optimize(replay, config, out, on_progress=None):
     worker_estimate = max(24*1024**2, n*2300)
     if available:
         budget = min(budget, available//4)
-    workers = min(requested or cpu_count(), population)
+    workers = min(requested or (1 if generic else cpu_count()), population)
     if available:
         workers = min(workers, max(1, (available//2)//worker_estimate))
     rng = random.Random(cfg['semente'])
@@ -359,12 +385,30 @@ def optimize(replay, config, out, on_progress=None):
     clock = time.monotonic()
 
     def parameters(genome):
-        return defaults | dict(zip(names, genome))
+        return defaults | dict(zip(keys, genome))
 
     def score_key(genome):
-        return tuple(value for name, value in zip(names, genome) if name not in CHEAP)
+        return genome if generic else tuple(value for name, value in zip(names, genome) if name not in CHEAP)
+
+    side = 1 if (replay.specification.get('lado') == 'venda'
+                 or (replay.specification.get('modo', 'classe') == 'classe'
+                     and str(config.get('classe_alvo', '1C')).upper().endswith('V'))) else 0
+
+    def strategy_metrics(ys, score, trade_score=None):
+        pred = score[:, side] > 0
+        result = metrics(ys, pred)
+        if financial:
+            result['sinais'] = int(np.count_nonzero(score[:,0] + score[:,1]))
+        trade_score = score if trade_score is None else trade_score
+        equity = np.r_[0, np.cumsum(trade_score[:,2])]
+        pnl = float(equity[-1])
+        drawdown = float((np.maximum.accumulate(equity)-equity).max())
+        return result | dict(resultado=pnl, drawdown=drawdown,
+                             resultado_menos_drawdown=pnl-drawdown, saidas=int(trade_score[:,3].sum()))
 
     def predictions(p, score):
+        if generic:
+            return score[:, side] > 0
         return ((replay.age >= p['p_BarrasAquecimento'])
                 & np.isfinite(score) & (score >= p['p_CorteScoreModelo']))
 
@@ -373,14 +417,22 @@ def optimize(replay, config, out, on_progress=None):
         results = {}
         for genome in genomes:
             p = parameters(genome)
-            pred = (local_score >= p['p_CorteScoreModelo']) & (local_age >= p['p_BarrasAquecimento'])
-            stats = metrics(labels, pred)
-            fitness = stats[metric] if stats['sinais'] >= minimum_signals else -1.0
+            if generic:
+                stats = strategy_metrics(labels, local_score, score)
+            else:
+                pred = (local_score >= p['p_CorteScoreModelo']) & (local_age >= p['p_BarrasAquecimento'])
+                stats = metrics(labels, pred)
+            fitness = stats[metric] if stats['sinais'] >= minimum_signals else -math.inf
             results[genome] = (fitness, stats)
         return results
 
     def run_group(genome, members, cache_hit):
-        score = cache_hit if cache_hit is not None else search_replay.score(parameters(genome))
+        try:
+            score = cache_hit if cache_hit is not None else search_replay.score(parameters(genome))
+        except (ValueError, TypeError, ArithmeticError) as error:
+            if not generic:
+                raise
+            return None, {genome: (-math.inf, {"erro": str(error)})}
         return score, assess(score, members)
 
     def random_genome():
@@ -405,7 +457,9 @@ def optimize(replay, config, out, on_progress=None):
                     break
         return list(candidates)
 
-    original = tuple(min(pool, key=lambda x: abs(x-defaults[name])) for name, pool in zip(names, pools))
+    original = tuple(defaults[key] if defaults[key] in pool else
+                     min(pool, key=lambda x: abs(x-defaults[key])) if type(defaults[key]) in {int,float}
+                     else pool[0] for key, pool in zip(keys, pools))
     candidates = populate([original])
     best, best_value, unchanged = None, -math.inf, 0
     reason = 'limite de gerações'
@@ -430,24 +484,28 @@ def optimize(replay, config, out, on_progress=None):
                 for key, future in futures:
                     score, results = future.result()
                     seen.update(results)
-                    if score.nbytes <= budget:
+                    if score is not None and score.nbytes <= budget:
                         scores[key] = score
                         scores.move_to_end(key)
                         while len(scores)*score.nbytes > budget:
                             scores.popitem(last=False)
-            available_candidates = [g for g in candidates if g in seen]
+            available_candidates = [g for g in candidates if g in seen and "erro" not in seen[g][1]]
             ranked = sorted(available_candidates, key=lambda g: seen[g][0], reverse=True)
             if not ranked:
-                reason = 'limite de tempo'
+                sample_error = next((seen[g][1]['erro'] for g in candidates
+                                     if g in seen and 'erro' in seen[g][1]), None)
+                if best is None and sample_error:
+                    raise ValueError(f"Nenhum candidato da primeira geração executou. Exemplo: {sample_error}")
+                reason = 'nenhum novo candidato executável'
                 break
             winner = ranked[0]
-            if seen[winner][0] > best_value:
+            if best is None or seen[winner][0] > best_value:
                 best, best_value, unchanged = winner, seen[winner][0], 0
             else:
                 unchanged += 1
             elapsed = round(time.monotonic()-clock, 2)
-            history.append(dict(geracao=generation, aptidao=best_value, avaliados=len(seen), segundos=elapsed)
-                           | seen[best][1] | dict(zip(names, best)))
+            history.append(dict(geracao=generation, aptidao=best_value if math.isfinite(best_value) else None, avaliados=len(seen), segundos=elapsed)
+                           | seen[best][1] | dict(zip((f"input:{name}" for name in names), best)))
             if on_progress:
                 on_progress(history, names)
             print(f'Geração {generation} | {metric}={best_value:.4f} | {len(seen)} candidatos | {elapsed}s', flush=True)
@@ -468,45 +526,57 @@ def optimize(replay, config, out, on_progress=None):
 
     fitted = parameters(best)
     optimized = dict(zip(names, best))
-    original_score = replay.score(defaults)
+    try:
+        original_score = replay.score(defaults)
+    except (ValueError, TypeError, ArithmeticError) as error:
+        if not generic:
+            raise
+        raise ValueError(f"A estratégia com os inputs originais falhou: {error}") from error
     scores.clear()
     best_score = replay.score(fitted)
     pred = predictions(fitted, best_score)
     baseline = predictions(defaults, original_score)
     summary = dict(
         classe_alvo=config.get('classe_alvo', '1C'), alvo=replay.specification, segundos_por_candle=replay.seconds,
-        entradas_na_abertura=True, configuracao=config,
-        arvores=len(replay.trees), arvores_removidas=len(replay.model.trees)-len(replay.trees),
+        entradas_na_abertura=not generic, motor='ntsl' if generic else 'ensemble', configuracao=config,
+        arvores=None if generic else len(replay.trees),
+        arvores_removidas=None if generic else len(replay.model.trees)-len(replay.trees),
         campos_excluidos=sorted(replay.excluded), threads=workers, cache_ram_mb=budget/1024**2,
         metrica=metric, parada=reason, candidatos_avaliados=len(seen), espaco_busca=total,
-        segundos_busca=history[-1]['segundos'], atende_min_sinais=best_value >= 0,
+        segundos_busca=history[-1]['segundos'], atende_min_sinais=math.isfinite(best_value),
         parametros_otimizados=optimized,
-        parametros_originais={name: defaults[name] for name in names},
+        parametros_originais={name: defaults[key] for name,key in zip(names,keys)},
         resultados={name: dict(
             pregoes=np.unique(replay.day[mask]).tolist(),
-            barras_com_score=int(np.count_nonzero(np.isfinite(best_score[mask]))),
-            original=metrics(replay.label[mask], baseline[mask]),
-            otimizado=metrics(replay.label[mask], pred[mask]),
+            barras_com_score=int(np.count_nonzero(mask)) if generic else int(np.count_nonzero(np.isfinite(best_score[mask]))),
+            original=strategy_metrics(replay.label[mask], original_score[mask], original_score[search_rows if name=='busca' else ~search_rows]) if generic else metrics(replay.label[mask], baseline[mask]),
+            otimizado=strategy_metrics(replay.label[mask], best_score[mask], best_score[search_rows if name=='busca' else ~search_rows]) if generic else metrics(replay.label[mask], pred[mask]),
         ) for name, mask in splits.items()},
     )
     (out/'metricas.json').write_text(json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False), encoding='utf-8')
     pd.DataFrame(history).to_csv(out/'evolucao.csv', index=False)
-    ranking = [dict(zip(names, g)) | {'aptidao': fitness} | stats for g, (fitness, stats) in seen.items()]
+    ranking = [dict(zip((f"input:{name}" for name in names), g)) | {'aptidao': fitness} | stats for g, (fitness, stats) in seen.items()]
     pd.DataFrame(ranking).sort_values('aptidao', ascending=False).to_csv(out/'candidatos.csv', index=False)
-    columns = ['minuto', 'ordem_no_minuto', 'v_barra_id', 'segmento', *OHLC]
+    columns = [col for col in ['minuto', 'ordem_no_minuto', 'v_barra_id', 'timestamp', 'inicio', 'segmento', *OHLC] if col in replay.frame]
     candles = replay.frame[columns]
     candles.to_csv(out/'candles.csv', index=False)
     predictions_csv = candles.assign(
-        classe_real=replay.frame.get('classe'), alvo_real=replay.label, score_original=original_score, score_otimizado=best_score,
+        classe_real=replay.frame.get('classe'), alvo_real=replay.label, score_original=original_score[:,side] if generic else original_score,
+        score_otimizado=best_score[:,side] if generic else best_score,
         sinal_original=baseline & base_mask, sinal_otimizado=pred & base_mask,
         amostra=np.select([search, test], ['busca', 'teste'], default='fora_do_horario'),
     )
+    if generic:
+        predictions_csv = predictions_csv.assign(resultado_original=original_score[:,2],
+                                                  resultado_otimizado=best_score[:,2])
     predictions_csv.loc[base_mask].to_csv(out/'predicoes.csv', index=False)
     warning = ''
-    if (best_value >= 0 and config.get('classe_alvo', '1C') == '1C'
+    if generic and math.isfinite(best_value):
+        (out/'inputs_otimizados.json').write_text(json.dumps(optimized, indent=2, ensure_ascii=False), encoding='utf-8')
+    elif (not generic and math.isfinite(best_value) and config.get('classe_alvo', '1C') == '1C'
             and replay.specification.get('modo', 'classe') == 'classe' and len(replay.trees) == len(replay.model.trees)):
         (out/'modelo_parametrizado.ntsl').write_text(replay.model.patched(optimized), encoding='utf-8')
-    elif best_value < 0:
+    elif not math.isfinite(best_value):
         warning = 'Nenhum candidato cumpriu o mínimo de sinais na busca.'
     else:
         warning = 'A avaliação reaproveita o score do ensemble. A configuração não é exportada como NTSL quando muda o alvo ou remove árvores.'
@@ -529,12 +599,26 @@ def write_html(out, summary, warning, history, names):
     mode = specification.get('modo', 'classe')
     if mode == 'classe':
         label = f"Classe {summary['classe_alvo']}"
+    elif mode == 'resultado':
+        label = 'Resultado operacional em pontos × contratos'
     elif mode == 'barras':
         label = f"{specification['lado']} · fechamento de {specification['barras']} barras"
     else:
         label = f"{specification['lado']} · toque de {specification['pontos']} pontos em {specification['barras']} barras"
     target = html.escape(label)
-    graphs = charts(history, names)
+    graphs = charts(history, names, financial=mode == 'resultado')
+    tree_note = '' if summary['motor'] == 'ntsl' else (
+        f"Árvores ativas: {summary['arvores']}. Árvores removidas: {summary['arvores_removidas']}.")
+    if summary['motor'] == 'ntsl':
+        details = []
+        for split, result in summary['resultados'].items():
+            for version in ('original', 'otimizado'):
+                m = result[version]
+                details.append(f"<li>{split} · {version} · {m['saidas']} saídas · resultado {m['resultado']:.2f} · drawdown {m['drawdown']:.2f}</li>")
+        trade_stats = '<h2>Execução em pontos × contratos</h2><ul>'+''.join(details)+'</ul>'
+    else:
+        trade_stats = ''
+    classification_style = 'hidden' if mode == 'resultado' else '' 
     note = html.escape(warning)
     content = f"""<!doctype html>
 <html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -551,12 +635,13 @@ figure{{margin:14px 0;padding:14px;background:white}} svg{{width:100%;max-height
 <p><strong>{target}</strong> · candles de {summary['segundos_por_candle']} s · {summary['candidatos_avaliados']} candidatos</p>
 <p>Parada por {html.escape(summary['parada'])}. {note}</p>
 <p>O teste usa pregões posteriores aos da busca. A matriz está na ordem VP, FP, FN, VN.
-Barras sem score ou em aquecimento contam como ausência de sinal.</p>
-<div class="table"><table><thead><tr><th>Amostra</th><th>Versão</th><th>Barras</th><th>Sinais</th>
+No classificador, barras sem score ou em aquecimento contam como ausência de sinal.</p>
+<div class="table" {classification_style}><table><thead><tr><th>Amostra</th><th>Versão</th><th>Barras</th><th>Sinais</th>
 <th>Acurácia</th><th>Precisão</th><th>Recall</th><th>F1</th><th>Acurácia balanceada</th><th>VP / FP / FN / VN</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table></div>
 <h2>Evolução por geração</h2>{graphs}
-<p>Árvores ativas: {summary["arvores"]}. Árvores removidas pelo filtro: {summary["arvores_removidas"]}.</p>
+{trade_stats}<p>{tree_note}</p>
+{'<a href="inputs_otimizados.json">Inputs otimizados para o Replay</a>' if summary["motor"]=="ntsl" and summary["atende_min_sinais"] else ""}
 <p><a href="candles.csv">Candles</a> · <a href="predicoes.csv">Predições</a> · <a href="candidatos.csv">Candidatos</a> ·
 <a href="evolucao.csv">Evolução</a> · <a href="metricas.json">Métricas completas</a></p>
 <details><summary>Configuração e resultados detalhados</summary><pre>{detail}</pre></details></html>"""
@@ -597,12 +682,19 @@ def main():
             print(f'{len(frame)} candles em {args.saida}')
         else:
             config = json.loads(args.config.read_text(encoding='utf-8-sig'))
-            model = NTSLModel(args.ntsl)
             seconds = int(config['segundos_por_candle'])
-            frame = read_export(args.csv, seconds)
-            validate_ohlc(frame)
+            if config.get('motor') == 'ntsl':
+                from estrategia import strategy_replay, source_text
+                replay = strategy_replay(args.csv, source_text(args.ntsl), seconds, config.get('formato','auto'),
+                                         config, config.get('tick',5), config.get('valor_ponto',1))
+            else:
+                model = NTSLModel(args.ntsl)
+                frame = read_export(args.csv, seconds)
+                validate_ohlc(frame)
+                replay = Replay(frame, model, seconds, config.get('classe_alvo', '1C'),
+                                config.get('alvo'), config.get('campos_excluidos', ()))
             args.saida.mkdir(parents=True, exist_ok=False)
-            optimize(Replay(frame, model, seconds, config.get('classe_alvo', '1C'), config.get('alvo'), config.get('campos_excluidos', ())), config, args.saida)
+            optimize(replay, config, args.saida)
     except (OSError, ValueError, KeyError, TypeError, AttributeError, ArithmeticError) as error:
         parser.exit(2, f'Erro: {error}\n')
 

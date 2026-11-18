@@ -1,0 +1,21 @@
+input
+Lote(1);
+Alvo(20);
+Filtro(True);
+var
+i: Integer;
+a: Array[1..3] of Float;
+function Duplo(x: Float): Float;
+begin Result := x*2; end;
+procedure Preenche(p: Integer);
+begin a[p] := Duplo(p); end;
+begin
+for i := 3 downto 1 do Preenche(i);
+i:=0;
+while i<2 do i:=i+1;
+repeat i:=i+1; until i=3;
+Plot(a[i]+Mod(CurrentBar(),2)+Media(2,Close)[1]);
+Plot2(AvgTrueRange(2,0));
+if Filtro and (Time=900) then SendOrder(osBuy,otMarket,Lote,0,0);
+if IsBought then SellToCoverLimit(BuyPrice+Alvo,Lote);
+end;

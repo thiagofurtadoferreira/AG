@@ -117,8 +117,12 @@ def chart(history, series, title, percent=False, axis='Geração'):
     return ''.join(result)+'</svg><div class="legenda">'+' · '.join(legend)+'</div></figure>'
 
 
-def charts(history, parameters):
+def charts(history, parameters, financial=False):
     result = chart(history, [('accuracy','Acurácia'),('precision','Precisão dos sinais'),
                              ('recall','Recall'),('f1','F1'),('balanced_accuracy','Acurácia balanceada')],
                    'Métricas do melhor candidato na busca', True)
-    return result + ''.join(chart(history, [(name,name)], name) for name in parameters)
+    if financial:
+        result = chart(history, [('resultado','Resultado'),('drawdown','Drawdown')],
+                       'Execução em pontos × contratos')
+    return result + ''.join(chart(history, [(f"input:{name}",name)], name) for name in parameters
+                            if history and isinstance(history[0][f"input:{name}"], (int,float)))

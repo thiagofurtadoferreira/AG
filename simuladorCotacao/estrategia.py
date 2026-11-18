@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from diagnostico import chart
-from ntsl import NTSLError, Rolling, SERIES, compile_ntsl
+from ntsl import ORDER_CONSTANTS, NTSLError, Rolling, SERIES, compile_ntsl
 from simulador import OHLC, read_export, read_ticks, validate_ohlc
 
 
@@ -99,6 +99,9 @@ class Engine:
         if not math.isfinite(self.point_value) or self.point_value <= 0:
             raise ValueError("O valor por ponto precisa ser positivo.")
         self.values = program.defaults.copy()
+        self.arrays = {symbol.slot: [0.0]*(program.defaults[symbol.slot][1]-program.defaults[symbol.slot][0]+1)
+                       for symbol in program.symbols.values() if symbol.kind == "array"}
+        self.loop_budget = 0
         self.series_data = {}
         required = {name: SERIES[name] for name in program.used & SERIES.keys()}
         for name, column in (("totalbuyqtd","v_qtd_compra_book"),
@@ -117,8 +120,8 @@ class Engine:
             name = name.lower()
             if name not in program.inputs:
                 raise ValueError(f"Input NTSL desconhecido: {name}.")
-            if not isinstance(value,(int,float,bool)) or not math.isfinite(value):
-                raise ValueError(f"O input {name} requer número finito ou booleano.")
+            if not isinstance(value,(int,float,bool,str)) or (not isinstance(value,str) and not math.isfinite(value)):
+                raise ValueError(f"O input {name} requer texto, número finito ou booleano.")
             self.values[program.symbols[name].slot] = value
         self.ignored_asset = any(symbol.kind == "asset" for symbol in program.symbols.values())
         self.seconds = seconds
@@ -142,7 +145,7 @@ class Engine:
         return float(self.series_data[name][index]) if index >= self.session_start else 0.0
 
     def read(self, slot):
-        if self.cursor == self.row or isinstance(self.values[slot], tuple):
+        if self.cursor == self.row or isinstance(self.values[slot], (tuple,str)):
             return self.values[slot]
         return self.history[self.cursor,slot]
 
@@ -160,7 +163,33 @@ class Engine:
 
     @staticmethod
     def cast(kind, value):
-        return bool(value) if kind == "boolean" else int(value)
+        if kind == "boolean":
+            return bool(value)
+        return int(value) if kind == "integer" else float(value)
+
+    def loop_step(self):
+        self.loop_budget -= 1
+        if self.loop_budget < 0:
+            raise NTSLError("limite de 100.000 iterações por candle atingido.")
+
+    def iterate(self, start, end, step):
+        start, end = self.integer(start, -10**12), self.integer(end, -10**12)
+        for value in range(start, end+step, step):
+            self.loop_step()
+            yield value
+
+    def array_index(self, slot, index):
+        lower, upper, _ = self.program.defaults[slot]
+        index = self.integer(index, lower)
+        if index > upper:
+            raise NTSLError(f"índice {index} fora do array [{lower}..{upper}].")
+        return index-lower
+
+    def read_array(self, slot, index):
+        return self.arrays[slot][self.array_index(slot,index)]
+
+    def write_array(self, slot, index, value):
+        self.arrays[slot][self.array_index(slot,index)] = self.cast(self.program.defaults[slot][2], value)
 
     @staticmethod
     def add(a,b):
@@ -193,6 +222,24 @@ class Engine:
             self.cursor = saved_row
         return state.value
 
+    def shift_call(self, offset, callback):
+        index = self.cursor-self.integer(offset,0)
+        if index < self.session_start:
+            return 0.0
+        original = self.cursor
+        self.cursor = index
+        try:
+            return callback()
+        finally:
+            self.cursor = original
+
+    def atr(self, key, period, kind):
+        kind = self.integer(kind,0)
+        kinds = ("media", "mediaexp", "wilder", "weighted")
+        if kind >= len(kinds):
+            raise NTSLError("AvgTrueRange aceita tipo de média entre 0 e 3.")
+        return self.average(key,kinds[kind],period,lambda: self.call("truerange"))
+
     def state(self, name):
         return {
             "isbought": self.position>0, "issold": self.position<0,
@@ -201,20 +248,67 @@ class Engine:
             "sellprice": self.basis if self.position<0 else 0,
             "price": self.basis, "position": self.position,
             "buyposition": max(0,self.position), "sellposition": max(0,-self.position),
-            "minpriceincrement": self.tick,
+            "minpriceincrement": self.tick, "positionqty": self.position,
+            "buypositionqty": max(0,self.position), "sellpositionqty": max(0,-self.position),
         }[name]
 
     def call(self, name, *args):
         math_calls = {"abs": abs, "max": max, "min": min, "sqrt": math.sqrt, "round": round,
-                      "floor": math.floor, "ceiling": math.ceil, "power": pow}
+                      "floor": math.floor, "ceiling": math.ceil, "power": pow,
+                      "mod": lambda x,y: int(math.fmod(int(x),int(y))),
+                      "intportion": math.trunc, "fracportion": lambda x: math.modf(x)[0],
+                      "square": lambda x: x*x, "sign": lambda x: int(x>0)-int(x<0),
+                      "log": math.log, "exp": math.exp}
         if name in math_calls:
             return math_calls[name](*args)
+        if name == "truerangecustom":
+            high, low, previous = args
+            return max(high,previous)-min(low,previous)
+        if name in {"truerange", "truehigh", "truelow", "typicalprice", "medianprice", "avgprice"}:
+            high, low = self.series("high"), self.series("low")
+            if name == "medianprice":
+                return (high+low)/2
+            if name == "typicalprice":
+                return (high+low+self.series("close"))/3
+            if name == "avgprice":
+                return (high+low+self.series("open")+self.series("close"))/4
+            prev = self.series("close",1) if self.cursor>self.session_start else self.series("open")
+            upper, lower = max(high,prev), min(low,prev)
+            return upper if name=="truehigh" else lower if name=="truelow" else upper-lower
         if name == "dailyresult":
             unrealized = (self.series("close")-self.basis)*self.position if args and args[0] else 0
             return (self.daily + unrealized) * self.point_value
         if name in {"totalbuyqtd","totalsellqtd"}:
             return self.series(name)
-        if name == "cancelpendingorders":
+        if name == "sendorder":
+            side, kind, qty, limit, stop = args
+            side_map = {ORDER_CONSTANTS["osbuy"]: "net_long", ORDER_CONSTANTS["ossell"]: "net_short"}
+            type_map = {ORDER_CONSTANTS["otmarket"]: "market", ORDER_CONSTANTS["otlimit"]: "limit",
+                        ORDER_CONSTANTS["otstoplimit"]: "stop"}
+            if side not in side_map or kind not in type_map:
+                raise NTSLError("SendOrder exige osBuy/osSell e otMarket/otLimit/otStopLimit.")
+            kind = type_map[kind]
+            price = float(stop if kind == "stop" else limit)
+            limit = float(limit) if kind == "stop" else None
+            if kind != "market" and (not math.isfinite(price) or price <= 0):
+                raise NTSLError("preço inválido em SendOrder.")
+            if kind == "stop" and (not math.isfinite(limit) or limit <= 0 or
+                                  (limit < price if side_map[side] == "net_long" else limit > price)):
+                raise NTSLError("limite inválido em SendOrder stop-limit.")
+            quantity = self.integer(qty,1)
+            key = f"sendorder_{side}_{kind}"
+            self.orders[key] = Order(name, side_map[side], kind, quantity, price, limit)
+            if side_map[side] == "net_long" and quantity > -self.position:
+                self.entry_intentions.add("long")
+            if side_map[side] == "net_short" and quantity > self.position:
+                self.entry_intentions.add("short")
+        elif name == "reverseposition":
+            if self.position:
+                self.orders.clear()
+                action = "net_short" if self.position>0 else "net_long"
+                self.orders[name] = Order(name,action,"market",2*abs(self.position))
+                self.entry_intentions.add("short" if self.position>0 else "long")
+        elif name == "cancelpendingorders":
             self.orders.clear()
         elif name == "consolelog":
             if len(self.logs) < 10_000:
@@ -275,7 +369,7 @@ class Engine:
 
     @staticmethod
     def match(order,o,h,l):
-        buying = order.action in {"long","exit_short"}
+        buying = order.action in {"long","exit_short","net_long"}
         price = order.price
         if order.kind == "market":
             return o
@@ -302,6 +396,16 @@ class Engine:
     def execute(self, order, price):
         action, quantity = order.action, order.quantity
         old = self.position
+        if action in {"net_long", "net_short"}:
+            direction = 1 if action == "net_long" else -1
+            if old*direction < 0:
+                closed = min(quantity,abs(old))
+                self.execute(Order(order.function,"exit_short" if direction>0 else "exit_long",
+                                   order.kind,closed),price)
+                quantity -= closed
+            if quantity:
+                self.execute(Order(order.function,"long" if direction>0 else "short",order.kind,quantity),price)
+            return
         pnl = 0.0
         if action in {"long","short"}:
             direction = 1 if action=="long" else -1
@@ -324,7 +428,7 @@ class Engine:
                 self.basis = 0.0
         self.fills.append(dict(barra=self.row+1,pregao=self.frame["pregao"].iat[self.row],
                                ordem=order.function,acao=action,preco=price,quantidade=quantity,
-                               pontos_contrato=pnl,posicao=self.position))
+                               pontos_contrato=pnl,posicao=self.position, tipo=order.kind))
 
     def process_orders(self):
         o,h,l = (self.series(name) for name in ("open","high","low"))
@@ -349,12 +453,12 @@ class Engine:
                 self.orders.pop(key,None)
                 self.execute(order,fill)
 
-    def run(self):
+    def run(self, record_trace=True):
         days = self.frame["pregao"].to_numpy()
         var_slots = self.variable_slots
         var_set = set(var_slots)
         constants = [(idx,val) for idx,val in enumerate(self.values) if idx not in var_set]
-        numeric_constants = [(idx,0.0 if isinstance(val,tuple) else val) for idx,val in constants]
+        numeric_constants = [(idx,0.0 if isinstance(val,(tuple,str)) else val) for idx,val in constants]
         for row in range(len(self.frame)):
             self.row = self.cursor = row
             if row==0 or days[row]!=days[row-1]:
@@ -364,9 +468,10 @@ class Engine:
             self.process_orders()
             self.plots = {}
             self.entry_intentions = set()
+            self.loop_budget = 100_000
             try:
                 self.program.strategy(self)
-            except (ValueError,TypeError,OverflowError,ZeroDivisionError) as error:
+            except (ValueError,TypeError,OverflowError,ZeroDivisionError,RecursionError) as error:
                 raise NTSLError(f"Barra {row+1}, pregão {days[row]}: {error}") from error
             for slot in var_slots:
                 self.history[row,slot] = self.values[slot]
@@ -377,7 +482,8 @@ class Engine:
                 if self.position:
                     action = "exit_long" if self.position>0 else "exit_short"
                     self.execute(Order("fim_pregao",action,"market",abs(self.position)),self.series("close"))
-            self.trace.append({"sinal_compra": "long" in self.entry_intentions,
+            if record_trace:
+                self.trace.append({"sinal_compra": "long" in self.entry_intentions,
                                "sinal_venda": "short" in self.entry_intentions,
                                "posicao":self.position,"pontos_contrato_acumulados":self.realized,**self.plots})
 
@@ -452,6 +558,67 @@ def main():
                                       args.formato,args.tick,overrides,args.valor_ponto),ensure_ascii=False,indent=2))
     except (ValueError,OSError,KeyError) as error:
         p.exit(2,f"Erro: {error}\n")
+
+
+class StrategyReplay:
+    """Executa o NTSL com cada conjunto de inputs do otimizador."""
+    def __init__(self, frame, program, seconds, target, specification, excluded, tick, point_value):
+        from diagnostico import BLOCKED, labels
+
+        self.frame, self.program, self.seconds = frame, program, seconds
+        self.target, self.specification = target, specification or {}
+        self.excluded = set(excluded) | BLOCKED
+        inputs = {SERIES[name] for name in program.used & SERIES.keys()}
+        if program.used & {"truerange","truehigh","truelow","typicalprice","medianprice","avgprice","avgtruerange"}:
+            inputs |= set(OHLC)
+        if "dailyresult" in program.used:
+            inputs.add("fechamento")
+        inputs |= {column for name, column in (("totalbuyqtd", "v_qtd_compra_book"),
+                                               ("totalsellqtd", "v_qtd_venda_book")) if name in program.used}
+        conflicts = inputs & self.excluded
+        if conflicts:
+            raise ValueError("O NTSL lê campos excluídos: " + ", ".join(sorted(conflicts))
+                             + ". Altere o código ou a seleção para executar a estratégia.")
+        self.tick, self.point_value = tick, point_value
+        self.day = frame["pregao"].to_numpy()
+        self.defaults = program.inputs
+        if self.specification.get("modo") == "resultado":
+            self.label, self.valid_label = np.zeros(len(frame), bool), np.ones(len(frame), bool)
+        else:
+            self.label, self.valid_label = labels(frame, target, self.specification)
+
+    def subset(self, mask):
+        return StrategyReplay(self.frame.loc[mask].reset_index(drop=True), self.program, self.seconds,
+                              self.target, self.specification, self.excluded, self.tick, self.point_value)
+
+    def score(self, parameters):
+        engine = Engine(self.program, self.frame, self.tick, parameters, self.seconds, self.point_value)
+        engine.run(record_trace=False)
+        scores = np.zeros((len(self.frame), 4))
+        for fill in engine.fills:
+            row = scores[fill["barra"]-1]
+            action = fill["acao"]
+            if action in {"long", "short"}:
+                if self.specification.get("modo") == "resultado" or fill["tipo"] == "market":
+                    row[0 if action == "long" else 1] = 1
+            else:
+                row[2] += fill["pontos_contrato"]
+                row[3] += 1
+        return scores
+
+
+def strategy_replay(path, source, seconds, format_name, config, tick, point_value):
+    format_name = csv_format(path, format_name)
+    frame = load_bars(path, seconds, format_name)
+    if "segmento" not in frame:
+        stamp = frame["inicio" if format_name == "negocios" else "timestamp"]
+        boundary = frame["pregao"].ne(frame["pregao"].shift()) | stamp.diff().ne(pd.Timedelta(seconds=seconds))
+        frame["segmento"] = boundary.cumsum()
+    specification = config.get("alvo", {})
+    if config["genetico"].get("metrica") in {"resultado", "resultado_menos_drawdown"}:
+        specification = specification | {"modo": "resultado"}
+    return StrategyReplay(frame, compile_ntsl(source), seconds, config.get("classe_alvo", "1C"),
+                          specification, config.get("campos_excluidos", ()), tick, point_value)
 
 
 if __name__=="__main__":
