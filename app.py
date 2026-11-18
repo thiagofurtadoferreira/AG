@@ -308,6 +308,27 @@ def file(jobid:str):
                         background=BackgroundTask(cleanup,jobid),
                         headers={"Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
 
+def youtube_diagnostic_once():
+    """Temporary one-off metadata test for a user-reported public Short."""
+    target = "https://www.youtube.com/shorts/5g83JHxpI8k"
+    cmd = [sys.executable, "-m", "yt_dlp", "--ignore-config", "--no-playlist",
+           "--skip-download", "--print", "id", "--js-runtimes", "node",
+           "--socket-timeout", "12", "--retries", "1", "--",
+           target]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           errors="replace", timeout=60)
+        details = (p.stderr or "").splitlines()
+        print("REELDROP_YOUTUBE_TEST result=" + str(p.returncode), flush=True)
+        for line in details[-24:]:
+            cleaned = re.sub(r"https?://\\S+", "[url]", line)
+            print("REELDROP_YOUTUBE_TEST " + cleaned[:450], flush=True)
+    except Exception as exc:
+        print("REELDROP_YOUTUBE_TEST exception=" + type(exc).__name__, flush=True)
+
+threading.Thread(target=youtube_diagnostic_once, daemon=True).start()
+
+
 PAGE = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ReelDrop — Baixar vídeos do Instagram, Facebook e YouTube</title>
