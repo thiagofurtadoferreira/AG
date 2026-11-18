@@ -1,0 +1,22 @@
+# Python / testes
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# temporários e vídeo
+*.mp4
+*.m4a
+*.webm
+*.part
+*.ytdl
+downloads/
+reeldrop-*/
+
+# configuração local sensível
+.env
+.env.*
+!.env.example
