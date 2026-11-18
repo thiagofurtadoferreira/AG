@@ -1,9 +1,0 @@
-input Lote(1);
-begin
-  if CurrentBar = 1 then BuyAtMarket(Lote);
-  if IsBought then
-  begin
-    SellToCoverLimit(BuyPrice + 20);
-    SellToCoverStop(BuyPrice - 10, BuyPrice - 15);
-  end;
-end;
