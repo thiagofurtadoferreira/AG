@@ -1,80 +1,88 @@
-# simuladorCotacao
+# simuladorCotacao 0.2.0
 
-O programa roda localmente e tem dois comandos. `candles` reconstrói OHLC a partir de negócios ou coloca em ordem o OHLC já exportado. `otimizar` lê o ensemble NTSL fornecido, calcula o score na abertura da barra e usa um algoritmo genético para procurar parâmetros que discriminem a classe alvo.
+## Abrir no Windows
 
-## Instalação e execução no Windows
+1. Extraia **todo o ZIP** para uma pasta gravável.
+2. Execute **SimuladorCotacao.exe**. A interface abre no navegador padrão, em endereço local da própria máquina. O runtime acompanha o programa.
+3. Selecione o CSV, escolha o formato, informe o intervalo e carregue um arquivo NTSL ou cole o código do Profit.
+4. Use **Replay da estratégia** e clique em **Executar**. Use **Abrir relatório** quando terminar.
+5. Use **Encerrar aplicativo** para fechar o processo local. Os arquivos de saída ficam em `%USERPROFILE%\simuladorCotacao\resultados`.
 
-Instale Python 3.11 ou superior, extraia o ZIP e abra o PowerShell na pasta do programa.
+Para testar a instalação com dados pequenos, selecione `exemplos/replay_minimo/candles.csv`, formato **Candles OHLC com timestamp**, e o `estrategia.ntsl` da mesma pasta. Com os valores padrão, o relatório deve mostrar dois preenchimentos e uma barra ambígua.
 
-```powershell
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe simulador.py otimizar --config config_v7.json --csv "C:\Dados\indicadorv7_claude.csv" --saida resultados_v7
-```
+O campo **Substituição de inputs (JSON)** pode permanecer como `{}`. Por exemplo, `{"p_Lote": 2}` substitui um input do código. Os nomes de inputs são comparados sem distinção entre maiúsculas e minúsculas. O incremento de preço alimenta `MinPriceIncrement`. O **valor por ponto e contrato** multiplica o resultado bruto e alimenta `DailyResult`. Configure esse valor para que os limites da estratégia usem a unidade desejada.
 
-No Linux, use `python3 -m venv .venv` e `.venv/bin/python` no lugar de `.\.venv\Scripts\python.exe`. O argumento `--saida` é opcional. Ao repetir uma execução, indique um diretório novo ou deixe o programa criar um automaticamente. Use `config_v6.json` para o CSV v6. O argumento `--ntsl` aponta para outro arquivo com o mesmo formato de exportação das árvores. O NTSL fornecido acompanha o projeto.
+## Formatos do CSV
 
-## Reconstruir candles
+| Formato | Campos | Comportamento |
+|---|---|---|
+| Indicador exportado do Profit | `data_minuto_origem;v_barra_id;abertura;maxima;minima;fechamento` e campos adicionais conforme a estratégia | Ordena por minuto e identificador. Use 1 s para v6 e 5 s para v7. |
+| Negócios | `timestamp;preco`, com `quantidade` e `sequencia` opcionais | Reconstrói OHLC por intervalo, conta negócios e soma quantidade quando disponível. |
+| Candles OHLC | `timestamp;abertura;maxima;minima;fechamento` | Ordena o timestamp ISO 8601 de cada candle, com uma linha por timestamp. |
 
-```powershell
-.\.venv\Scripts\python.exe simulador.py candles "C:\Dados\negocios.csv" --formato negocios --segundos 5 --saida candles_5s.csv
-.\.venv\Scripts\python.exe simulador.py candles "C:\Dados\indicadorv6_claude.csv" --formato profit --segundos 1 --saida candles_v6.csv
-```
+O separador é ponto e vírgula. Preços inteiros e decimais com vírgula são aceitos. Nos formatos com `timestamp`, use data e hora ISO 8601, por exemplo `2026-11-16T09:15:00.100`. A exportação v6/v7 registra a hora até o minuto. A saída preserva a ordem dentro do minuto sem atribuir segundos exatos.
 
-### CSV de negócios
+### Colunas adicionais
 
-Use uma linha por negócio e separador ponto e vírgula. Use timestamp local ISO 8601 com data e hora. `sequencia` e `quantidade` são opcionais. O programa ordena por timestamp e, quando fornecida, por sequência para desempatar. Sem sequência, conserva a ordem original em horários idênticos.
-
-```csv
-timestamp;preco;quantidade;sequencia
-2026-11-16T09:15:00.100;169550;2;1
-2026-11-16T09:15:00.900;169560;1;2
-2026-11-16T09:15:01.500;169545;3;3
-```
-
-Cada janela inclui o instante inicial e exclui seu limite final. O primeiro negócio é a abertura, o último é o fechamento e os extremos são a máxima e a mínima. O programa omite intervalos sem negócios. O CSV produzido contém OHLC, contagem de negócios e soma de quantidade quando fornecida. Para a calibração das árvores, use o CSV rotulado do indicador, que também contém agressões, book e estados do setup.
-
-### CSV do indicador
-
-O programa usa `data_minuto_origem` e `v_barra_id` em conjunto. Na v6, o identificador reinicia em trechos diferentes do mesmo pregão. A saída mantém minuto e ordem dentro do minuto. O intervalo nominal é de 1 segundo na v6 e 5 segundos na v7. A exportação tem resolução de um minuto e uma barra não pode ser decomposta em negócios a partir de OHLC. Janelas de indicadores reiniciam na mudança de pregão, em lacunas e nas fronteiras de minutos parciais.
-
-## Configuração da busca genética
-
-Edite uma cópia do JSON correspondente à sua base.
-
-| Campo | Efeito |
+| Recursos NTSL | CSV |
 |---|---|
-| `classe_alvo` | Rótulo literal da coluna `classe`, por exemplo `"1C"`. Cada execução avalia uma classe contra as demais. |
-| `segundos_por_candle` | Resolução nominal do CSV, usada para conferir a quantidade de barras por minuto. |
-| `pregoes_teste` | Quantidade dos últimos pregões reservada para a avaliação final. |
-| `parametros` | Declare `min`, `max` e `passo` para cada parâmetro a pesquisar. Os demais assumem o valor do NTSL. |
-| `genetico.populacao`, `geracoes`, `mutacao`, `semente` | Controlam tamanho da população, limite de gerações, probabilidade de mutação por gene e sorteio. |
-| `genetico.metrica` | Aceita `f1`, `precision`, `recall`, `balanced_accuracy` ou `accuracy`. |
-| `genetico.min_sinais` | Mínimo de sinais na busca para aceitar um candidato. |
-| `genetico.paciencia` | Limite de gerações consecutivas sem melhora. Zero desativa. |
-| `genetico.limite_segundos` | Orçamento da busca. Um lote em execução pode terminar depois do limite. Zero desativa. |
-| `genetico.meta` | Valor desejado de 0 a 1 para a métrica. `null` desativa. |
-| `threads` | Zero usa os núcleos lógicos disponíveis, limitado pela população e por uma estimativa de RAM livre. Valores positivos definem o máximo. |
-| `cache_ram_mb` | Teto para os vetores de score em cache. Zero desativa o cache entre lotes. |
+| `Trades`, `Volume`, `Quantity` | `v_trades_atual`, `volume`, `volume_contratos` |
+| `AgressionVolBuy`, `AgressionVolSell` | `v_agressao_compra`, `v_agressao_venda` |
+| `BidPrice`, `AskPrice`, `BidSize`, `AskSize` | `v_bid`, `v_ask`, `v_qtd_bid`, `v_qtd_ask` |
+| `TotalBuyQtd`, `TotalSellQtd` | `v_qtd_compra_book`, `v_qtd_venda_book` |
 
-Parâmetros suportados nesta versão
+Estratégias que dependem de alguma dessas séries exigem a respectiva coluna. No formato negócios, `Trades` é calculado e `Quantity` fica disponível quando há quantidade por negócio. O OHLC de negócios por si só deixa book e agressão indisponíveis.
 
-- `p_CorteScoreModelo` e `p_BarrasAquecimento`.
-- `p_PeriodoATR`, `p_PeriodoMedia`, `p_PeriodoVolatilidade`, `p_PeriodoEficiencia` e `p_PeriodoMediaTrades`.
+## Módulo NTSL
 
-A busca preserva o melhor candidato e combina parâmetros dos mais aptos com cruzamento, mutação e amostragem aleatória. As combinações já avaliadas são reaproveitadas. Candidatos que só diferem em limiar ou aquecimento compartilham o cálculo do score. As threads usam a mesma base em memória e processam em paralelo as combinações que exigem scores diferentes. O teto de cache não representa um limite total do processo. O CSV é carregado em memória.
+Compila `input`, `const`, `var`, `begin/end`, `if/then/else`, atribuições e operadores aritméticos, relacionais e booleanos. Aceita referências históricas com `[n]`, OHLC, horário, posição, médias simples e exponenciais, máximas e mínimas de janela, soma móvel e funções matemáticas básicas. Implementa entradas e saídas a mercado, limite e stop, cancelamento, zeragem, `Plot`, `PaintBar` e `ConsoleLog`. O arquivo `exemplo_cruzamento.ntsl` demonstra uma estratégia simples. A estratégia do pacote pode ser carregada pelo botão na tela.
 
-## Relatórios
+- Funções ou procedimentos definidos pelo usuário, comandos de laço, arrays próprios, indicadores fora da lista do compilador e múltiplos ativos ainda estão fora do subconjunto desta versão. Identificadores incompatíveis geram erro com a linha do código.
+- `Asset(GetAsset, ...)` permite ligar as chamadas de book aos snapshots exportados. O replay não reconstrói os níveis do book ou séries independentes por ativo ou intervalo. O parâmetro de profundidade é representado pelo agregado já existente no CSV.
+- As séries históricas se restringem ao pregão. No início do pregão, referências sem histórico acessível retornam zero para dados de mercado e o valor padrão para variáveis. As médias usam o histórico disponível no pregão. A estratégia pode definir aquecimento próprio.
+- `Date` e `Time` usam a data do candle e a hora HHMM. O intervalo da interface organiza os dados e fica registrado no relatório. Altere explicitamente os inputs temporais do seu código quando forem diferentes do intervalo analisado.
 
-Abra `relatorio.html` no navegador. O relatório compara modelo original e otimizado, mede precisão, recall, F1, acurácia balanceada e apresenta a matriz de confusão. O diretório também contém `metricas.json`, `candles.csv`, `predicoes.csv`, `candidatos.csv` e `evolucao.csv`. Para a classe 1C e uma combinação válida, o programa gera `modelo_parametrizado.ntsl` alterando os valores dos inputs pesquisados.
+## Preenchimentos e limitações do replay
 
-No score da abertura, o único valor da barra atual usado pelas árvores fornecidas é o gap de abertura. As demais variáveis usadas no score vêm de barras fechadas. A coluna de classe entra na avaliação, e o indicador histórico auxiliar `v_FlagClasse1C` é reconstruído do OHLC passado conforme o código recebido. Barras dentro do horário de entrada com rótulo válido entram no denominador da avaliação. Se estiverem em aquecimento ou sem score, contam como ausência de sinal.
+O código é avaliado uma vez, no **fechamento**. Ordens emitidas no fechamento podem executar a partir da próxima barra disponível. Ordens a mercado usam a abertura seguinte. Limites e stops usam os extremos da barra com ajuste de gap. Um stop com limite que sofre gap além do limite pode permanecer pendente para a barra seguinte.
 
-## Limites de reprodução
+Se alvo e stop forem tocados na mesma barra, o relatório registra ambiguidade e aplica o preenchimento menos favorável entre as saídas tocadas. Uma ordem a mercado já pendente tem prioridade na abertura. O replay mantém uma posição líquida, substitui ordens pendentes da mesma função e limita saídas ao saldo da posição. Ao fim de cada pregão, cancela ordens pendentes e encerra a posição restante no último fechamento disponível.
 
-- O leitor aceita o formato de árvores do NTSL fornecido. Esse ensemble já foi treinado para **1C**. Para outra classe, a execução só mede quanto o score atual consegue discriminá-la. Treinar outro classificador requer uma etapa adicional.
-- A simulação recalcula as séries implementadas a partir de OHLC e agressão. Usa os snapshots exportados para book e estados do setup, como referência, recuo e pressão de saída. Alterar um período pode mudar esses estados dentro do Profit. A paridade do score e dos sinais deve ser conferida no Replay.
-- A resolução do CSV não altera `p_SegundosPorBarra`, que permanece com o valor fixado no NTSL para a fórmula de aceleração. Confira a configuração do gráfico e do modelo antes de importar os parâmetros.
-- As métricas são de classificação por candle, sem executar ordens ou calcular fills, stop, alvo, slippage ou P&L. Os últimos pregões ficaram fora da busca genética. O ZIP não contém o histórico de treinamento das 150 árvores para verificar se elas já haviam visto esses pregões.
+O simulador usa hipóteses de preenchimento por OHLC, sem reproduzir fila, custos, latência, timestamps intrabar ou o motor do Replay Profit. A estratégia das 150 árvores pode ser analisada pelo classificador na abertura via modo **Otimização genética**, ou executada no fechamento via **Replay da estratégia**. Os dois modos têm unidades de avaliação e regras de execução próprias.
 
-A pasta `exemplos` traz métricas e evolução das execuções de verificação com os dois CSVs fornecidos.
+### Relatórios
+
+- `relatorio.html` e `metricas.json` resumem preenchimentos, saídas, pontos × contratos, drawdown realizado, inputs, hash do código e ambiguidades.
+- `execucoes.csv` lista preenchimentos. `candles.csv` contém OHLC, intenções de entrada, posição, pontos acumulados e chamadas de plot.
+- `console.csv` contém as primeiras 10 mil mensagens de `ConsoleLog`.
+- `estrategia.ntsl` guarda o código efetivamente executado. Os inputs aplicados ficam em `metricas.json`.
+
+## Otimizador genético
+
+Use **Otimização genética do ensemble**, o CSV de indicador rotulado e um NTSL compatível com o formato de árvores do modelo fornecido. Defina no JSON a classe, os parâmetros, faixas e passos, a métrica, população, número máximo de gerações, tempo, meta, paciência, threads e cache RAM. A execução reserva os últimos pregões para o teste.
+
+O replay aceita o subconjunto NTSL descrito acima. A otimização genética desta versão opera sobre o classificador de árvores. Veja [README-otimizador.md](README-otimizador.md) para o formato e os parâmetros suportados.
+
+## Linha de comando
+
+No PowerShell, abra a pasta extraída:
+
+```powershell
+.\SimuladorCotacao-CLI.exe --version
+.\SimuladorCotacao-CLI.exe estrategia --csv "C:\Dados\indicadorv7_claude.csv" --ntsl .\modelo_profit.ntsl --segundos 5 --formato profit --saida .\replay_v7
+.\SimuladorCotacao-CLI.exe otimizar --config .\config_v7.json --csv "C:\Dados\indicadorv7_claude.csv" --saida .\otim_v7
+.\SimuladorCotacao-CLI.exe candles "C:\Dados\negocios.csv" --formato negocios --segundos 5 --saida .\candles.csv
+```
+
+## Código e reconstrução do pacote
+
+O motor e a interface estão em `ntsl.py`, `estrategia.py`, `app.py` e `interface.html`. A versão está em `VERSION`, nas propriedades dos executáveis e no [CHANGELOG.md](CHANGELOG.md). A pasta `windows` contém fonte dos launchers e dependências fixadas.
+
+Em Linux, use Python 3.11+ e um toolchain MinGW-w64 x64. Baixe a distribuição embutida do Python **3.12.10 Windows x64** e as wheels correspondentes. Depois:
+
+```bash
+python -m pip download --only-binary=:all: --platform win_amd64 --python-version 312 -r windows/requirements.lock -d wheels
+python windows/package.py --python-win python-3.12.10-embed-amd64.zip --wheels wheels --saida simuladorCotacao-v0.2.0-win64.zip
+```
+
+Para desenvolver ou testar com o seu Python local, instale `requirements.txt` e rode `python app.py`. Para um comando de terminal no código-fonte, use `python app.py --cli estrategia --help`.

@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Simulador de Cotação</title>
+<style>
+:root{color-scheme:light;--ink:#18302e;--muted:#4e6763;--paper:#fff;--line:#cad9d6;--accent:#155c50}
+*{box-sizing:border-box}body{margin:0;background:#edf4f2;color:var(--ink);font:16px/1.5 system-ui,sans-serif}
+header,main{max-width:1100px;margin:auto;padding:0 24px}header{padding-top:44px;padding-bottom:20px}
+h1{font-size:clamp(2rem,5vw,3rem);letter-spacing:-.05em;margin:0}h2{font-size:1.22rem;margin:0 0 14px}
+form{display:grid;grid-template-columns:1fr 1.55fr;gap:16px}.panel{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:22px;min-width:0}
+.options,.result{grid-column:1/-1}label{display:block;font-weight:650;margin:0 0 5px}
+input,select,textarea{display:block;width:100%;padding:9px 10px;background:#f9fbfa;border:1px solid #aec2be;border-radius:7px;color:var(--ink);font:inherit}
+input[type=file]{padding:7px}textarea{font:13px/1.5 Consolas,monospace;resize:vertical}
+#ntsl{min-height:180px}#opcoes{min-height:86px}.field{margin-bottom:13px}.split{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+small,p{color:var(--muted)}small{display:block;margin-top:6px}p{margin:8px 0}
+button{font:650 14px system-ui;border:1px solid #9ab6af;background:#fff;color:var(--accent);padding:9px 13px;border-radius:7px;cursor:pointer}
+button:disabled{opacity:.55;cursor:default}.primary{background:var(--accent);color:white;border-color:var(--accent);padding:11px 21px}
+.actions{display:flex;flex-wrap:wrap;gap:9px;margin:12px 0}.top{display:flex;justify-content:space-between;align-items:start;gap:10px}
+#situacao{white-space:pre-wrap;overflow-wrap:anywhere}a{color:var(--accent);font-weight:650}
+@media(max-width:700px){form{grid-template-columns:1fr}header{padding-top:26px}}
+</style>
+</head>
+<body>
+<header class="top"><h1>Simulador de Cotação</h1><button id="encerrar" type="button">Encerrar aplicativo</button></header>
+<main>
+<form id="form">
+<section class="panel">
+<h2>Dados</h2>
+<div class="field"><label for="csv">CSV de entrada</label><input id="csv" type="file" accept=".csv,text/csv" required></div>
+<div class="field"><label for="formato">Formato</label><select id="formato"><option value="profit">Indicador exportado do Profit</option><option value="negocios">Negócios com timestamp</option><option value="ohlc">Candles OHLC com timestamp</option></select></div>
+<div class="split">
+<div><label for="segundos">Candle em segundos</label><input type="number" id="segundos" value="5" min="1" required></div>
+<div><label for="tick">Incremento de preço</label><input type="number" id="tick" value="5" min="0.000001" step="any" required></div>
+</div>
+<div class="field" style="margin-top:13px"><label for="valor-ponto">Valor por ponto e contrato</label><input id="valor-ponto" type="number" value="1" step="any" min="0.000001" required><small>Multiplicador usado por DailyResult no replay.</small></div>
+<small>Nos CSVs enviados, a v6 usa 1 segundo e a v7 usa 5 segundos.</small>
+</section>
+<section class="panel">
+<h2>Estratégia NTSL</h2>
+<div class="field"><label for="arquivo">Carregar arquivo</label><input id="arquivo" type="file" accept=".ntsl,.txt,.pas"></div>
+<div class="field"><label for="ntsl">Código</label><textarea id="ntsl" spellcheck="false" required></textarea></div>
+<button type="button" id="modelo">Usar estratégia do pacote</button>
+</section>
+<section class="panel options">
+<h2>Execução</h2>
+<div class="field"><label for="modo">Modo</label><select id="modo"><option value="estrategia">Replay da estratégia</option><option value="otimizar">Otimização genética do ensemble</option></select></div>
+<div class="field"><label for="opcoes" id="titulo-opcoes">Substituição de inputs (JSON)</label><textarea id="opcoes" spellcheck="false">{}</textarea><small id="ajuda-opcoes">Use {} para aplicar os valores do código. Exemplo de ajuste: {"p_Lote": 2}.</small></div>
+<div class="actions"><button class="primary" id="executar" type="submit">Executar</button></div>
+</section>
+<section class="panel result"><h2>Resultado</h2><p id="situacao" role="status" aria-live="polite">Aguardando dados e estratégia.</p><a id="relatorio" hidden target="_blank" rel="noopener">Abrir relatório</a></section>
+</form>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let running = false, timer = null, optimizationTemplate = null, replaySettings = "{}";
+const endpoint = name => new URL(name, window.location.href);
+const show = message => { $("situacao").textContent = message; };
+const busy = active => {
+    running = active;
+    $("executar").disabled = active;
+    $("encerrar").disabled = active;
+};
+async function post(name, body, type) {
+    const response = await fetch(endpoint(name), {method:"POST",body,headers:{"Content-Type":type}});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.erro || "Falha na execução.");
+    return data;
+}
+$("arquivo").addEventListener("change", async () => {
+    const file = $("arquivo").files[0];
+    if (!file) return;
+    try {
+        const bytes = await file.arrayBuffer();
+        try { $("ntsl").value = new TextDecoder("utf-8",{fatal:true}).decode(bytes); }
+        catch { $("ntsl").value = new TextDecoder("windows-1252").decode(bytes); }
+    } catch (error) { show(error.message); }
+});
+$("modelo").addEventListener("click", async () => {
+    try {
+        const response = await fetch(endpoint("modelo-exemplo"));
+        if (!response.ok) throw Error("Falha ao abrir a estratégia do pacote.");
+        $("ntsl").value = await response.text();
+    } catch (error) { show(error.message); }
+});
+$("modo").addEventListener("change", async () => {
+    const optimize = $("modo").value === "otimizar";
+    if (optimize) {
+        replaySettings = $("opcoes").value;
+        try {
+            if (optimizationTemplate === null) {
+                const response = await fetch(endpoint("config-exemplo"));
+                optimizationTemplate = JSON.stringify(await response.json(),null,2);
+            }
+            if ($("modo").value === "otimizar") $("opcoes").value = optimizationTemplate;
+        } catch (error) { show(error.message); }
+    } else {
+        optimizationTemplate = $("opcoes").value;
+        $("opcoes").value = replaySettings;
+    }
+    $("titulo-opcoes").textContent = optimize ? "Configuração genética (JSON)" : "Substituição de inputs (JSON)";
+    $("ajuda-opcoes").textContent = optimize
+        ? "Selecione o CSV do indicador Profit. Este modo usa o formato de árvores do modelo fornecido."
+        : "Use {} para aplicar os valores do código. Exemplo de ajuste: {\"p_Lote\": 2}.";
+});
+async function poll() {
+    try {
+        const response = await fetch(endpoint("estado"));
+        const state = await response.json();
+        if (state.estado === "executando") {
+            timer = setTimeout(poll,1200);
+        } else {
+            busy(false);
+            if (state.estado === "concluido") {
+                show("Execução concluída.\n" + state.pasta);
+                $("relatorio").href = endpoint("resultados/"+state.id+"/relatorio.html");
+                $("relatorio").hidden = false;
+            } else {
+                show(state.mensagem || "Aguardando dados e estratégia.");
+            }
+        }
+    } catch (error) { busy(false); show(error.message); }
+}
+$("form").addEventListener("submit", async event => {
+    event.preventDefault();
+    if (running) return;
+    busy(true);
+    $("relatorio").hidden = true;
+    try {
+        const options = {
+            modo:$("modo").value, csv:$("csv").files[0].name, ntsl:$("ntsl").value,
+            formato:$("formato").value, segundos:Number($("segundos").value),
+            tick:Number($("tick").value), valor_ponto:Number($("valor-ponto").value), opcoes:JSON.parse($("opcoes").value || "{}")
+        };
+        show("Lendo o CSV local…");
+        await post("csv",$("csv").files[0],"text/csv");
+        await post("executar",JSON.stringify(options),"application/json");
+        show("Executando…");
+        poll();
+    } catch (error) { busy(false); show(error.message); }
+});
+$("encerrar").addEventListener("click", async () => {
+    try {
+        await post("encerrar","", "text/plain");
+        clearTimeout(timer);
+        busy(true);
+        show("Aplicativo encerrado. Você pode fechar esta aba.");
+    } catch (error) { show(error.message); }
+});
+</script>
+</body>
+</html>
